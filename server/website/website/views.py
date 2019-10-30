@@ -269,11 +269,10 @@ def session_view(request, project_id, session_id):
                                                      task_type=1).order_by('-creation_time')
         if len(pruned_metrics) > 0:
             num_metrics = str(len(JSONUtil.loads(pruned_metrics[0].data)))
-            pipeline_time = PipelineData.objects.filter(workload=workload)
-            pipeline_time = [pipelineData.pipeline_run for pipelineData in pipeline_time]
+            pipeline_time = [pipelineData.pipeline_run for pipelineData in pruned_metrics]
             pipeline_time = [(pipelineRun.end_time - pipelineRun.start_time).total_seconds()
                              for pipelineRun in pipeline_time if pipelineRun.end_time is not None]
-            sec = sum(pipeline_time) / (len(pipeline_time) / 4)
+            sec = sum(pipeline_time) / len(pipeline_time)
             pipeline_time = str(dt.timedelta(seconds=sec))
             pipeline_time = pipeline_time[:pipeline_time.find(".")]
 
