@@ -24,6 +24,19 @@ padding-left: 25px;
 border: 2px solid #F5F5F5;
 }
 
+#sidepanel {
+    flex: 1;
+    height:165px;
+    border-style: solid;
+    border-width: 2px;
+    border-color: #999999;
+    margin-left:10px;
+    margin-top:2em;
+    background-color: #FDFBF4;
+    color: #5F5F5F;
+    font-size: 14px;
+}
+
 caption > h4 { 
   display: inline-block;
   position: relative;
@@ -205,7 +218,18 @@ caption span {float: right;}
     </div>
 
     <div id="content" class="col-sm-12">
-        <div id="plotgrid" class="plotcontainer row"></div>
+        <div style="display:flex;">
+          <div id="plotgrid" class="plotcontainer row" style="flex: 0 0 85%;"></div>
+          <div id="sidepanel">
+              <center>
+                 <u>Information</u><br>
+                 Knobs Tuned: {{num_knobs}}<br>
+                 Pruned Metrics: {{num_metrics}}<br>
+                 Results: {{num_sample_points}}<br>
+                 Preprocessing: {{pipeline_time}}
+              </center>
+          </div>
+        </div>
         <div id="result_table">
             <h4>Filtered Results</h4>
             <table id="dataTable">

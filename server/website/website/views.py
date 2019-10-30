@@ -5,7 +5,7 @@
 #
 # pylint: disable=too-many-lines
 import logging
-import datetime
+import datetime as dt
 import re
 from collections import OrderedDict
 
@@ -30,7 +30,8 @@ from pytz import timezone
 from .db import parser, target_objectives
 from .forms import NewResultForm, ProjectForm, SessionForm, SessionKnobForm
 from .models import (BackupData, DBMSCatalog, KnobCatalog, KnobData, MetricCatalog,
-                     MetricData, Project, Result, Session, Workload, SessionKnob)
+                     MetricData, Project, Result, Session, Workload, SessionKnob,
+                     PipelineData)
 from .tasks import (aggregate_target_results, map_workload, train_ddpg,
                     configuration_recommendation, configuration_recommendation_ddpg)
 from .types import (DBMSType, KnobUnitType, MetricType,
@@ -258,6 +259,24 @@ def session_view(request, project_id, session_id):
     form_labels = Session.get_labels()
     form_labels['title'] = "Session Info"
 
+    num_knobs = str(len(knob_names))
+    num_sample_points = str(len(results))
+    num_metrics = "Not available"
+    pipeline_time = "Not available"
+    if default_workload != 'show_none':
+        workload = workloads[default_workload][0]
+        pruned_metrics = PipelineData.objects.filter(workload=workload,
+                                                     task_type=1).order_by('-creation_time')
+        if len(pruned_metrics) > 0:
+            num_metrics = str(len(JSONUtil.loads(pruned_metrics[0].data)))
+            pipeline_time = PipelineData.objects.filter(workload=workload)
+            pipeline_time = [pipelineData.pipeline_run for pipelineData in pipeline_time]
+            pipeline_time = [(pipelineRun.end_time - pipelineRun.start_time).total_seconds()
+                             for pipelineRun in pipeline_time if pipelineRun.end_time is not None]
+            sec = sum(pipeline_time) / (len(pipeline_time) / 4)
+            pipeline_time = str(dt.timedelta(seconds=sec))
+            pipeline_time = pipeline_time[:pipeline_time.find(".")]
+
     context = {
         'project': project,
         'dbmss': dbmss,
@@ -276,6 +295,10 @@ def session_view(request, project_id, session_id):
         'session': session,
         'results': results,
         'labels': form_labels,
+        'num_metrics': num_metrics,
+        'num_sample_points': num_sample_points,
+        'num_knobs': num_knobs,
+        'pipeline_time': pipeline_time,
     }
     context.update(csrf(request))
     return render(request, 'session.html', context)
