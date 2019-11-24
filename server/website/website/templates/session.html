@@ -214,6 +214,7 @@ caption span {float: right;}
         </div>
         <div class="col-sm-2 checkbox">
             <label><input id="equidistant" class="option" name="equidistant" type="checkbox"/> Equidistant</label>
+            <label><input id="sidePanelOnButton" class="option" type="checkbox" onclick="toggleSidePanel()" checked="true"/> Side Panel</label>
         </div>
     </div>
 
@@ -326,6 +327,26 @@ $(document).ready(function(){
     });
   });
 });
+</script>
+
+<script>
+function toggleSidePanel(){
+  var sidePanelOnButton = document.getElementById("sidePanelOnButton");
+  var sidePanel = document.getElementById("sidepanel");
+  var plotGrid = document.getElementById("plotgrid");
+  var equidistantButton = document.getElementById("equidistant");
+  if (sidePanelOnButton.checked == true){
+    sidePanel.style.display="block";
+    plotGrid.style.flex="0 0 85%";
+    equidistantButton.click();
+    equidistantButton.click(); //This is to refresh the graph
+  }else{
+    sidePanel.style.display="none";
+    plotGrid.style.flex="1";
+    equidistantButton.click();
+    equidistantButton.click(); //This is to refresh the graph
+  }
+}
 </script>
 
 {% endblock body %}
