@@ -25,6 +25,8 @@ INIT_FLIP_PROB = 0.3
 FLIP_PROB_DECAY = 0.5
 
 # ---GPR CONSTANTS---
+USE_GPFLOW = True
+
 DEFAULT_LENGTH_SCALE = 1.0
 
 DEFAULT_MAGNITUDE = 1.0
@@ -56,6 +58,13 @@ DEFAULT_SIGMA_MULTIPLIER = 3.0
 
 DEFAULT_MU_MULTIPLIER = 1.0
 
+DEFAULT_UCB_SCALE = 0.2
+
+# ---HYPERPARAMETER TUNING FOR GPR---
+HP_MAX_ITER = 5000
+
+HP_LEARNING_RATE = 0.001
+
 # ---GRADIENT DESCENT FOR DNN---
 DNN_TRAIN_ITER = 500
 
@@ -77,7 +86,16 @@ DNN_DEBUG_INTERVAL = 100
 DDPG_BATCH_SIZE = 32
 
 #  Learning rate of actor network
-ACTOR_LEARNING_RATE = 0.01
+ACTOR_LEARNING_RATE = 0.02
 
 #  Learning rate of critic network
 CRITIC_LEARNING_RATE = 0.001
+
+#  Number of update epochs per iteration
+UPDATE_EPOCHS = 30
+
+#  The number of hidden units in each layer of the actor MLP
+ACTOR_HIDDEN_SIZES = [128, 128, 64]
+
+#  The number of hidden units in each layer of the critic MLP
+CRITIC_HIDDEN_SIZES = [64, 128, 64]

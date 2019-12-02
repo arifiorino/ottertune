@@ -6,6 +6,8 @@
 import random
 import queue
 import numpy as np
+import tensorflow as tf
+import gpflow
 from pyDOE import lhs
 from scipy.stats import uniform
 
@@ -18,6 +20,9 @@ from analysis.ddpg.ddpg import DDPG
 from analysis.gp import GPRNP
 from analysis.gp_tf import GPRGD
 from analysis.nn_tf import NeuralNet
+from analysis.gpr import gpr_models
+from analysis.gpr import ucb
+from analysis.gpr.optimize import tf_optimize
 from analysis.preprocessing import Bin, DummyEncoder
 from analysis.constraints import ParamConstraintHelper
 from website.models import PipelineData, PipelineRun, Result, Workload, KnobCatalog, SessionKnob
@@ -25,13 +30,15 @@ from website import db
 from website.types import PipelineTaskType, AlgorithmType
 from website.utils import DataUtil, JSONUtil
 from website.settings import IMPORTANT_KNOB_NUMBER, NUM_SAMPLES, TOP_NUM_CONFIG  # pylint: disable=no-name-in-module
-from website.settings import (DEFAULT_LENGTH_SCALE, DEFAULT_MAGNITUDE,
+from website.settings import (USE_GPFLOW, DEFAULT_LENGTH_SCALE, DEFAULT_MAGNITUDE,
                               MAX_TRAIN_SIZE, BATCH_SIZE, NUM_THREADS,
                               DEFAULT_RIDGE, DEFAULT_LEARNING_RATE,
                               DEFAULT_EPSILON, MAX_ITER, GPR_EPS,
                               DEFAULT_SIGMA_MULTIPLIER, DEFAULT_MU_MULTIPLIER,
+                              DEFAULT_UCB_SCALE, HP_LEARNING_RATE, HP_MAX_ITER,
                               DDPG_BATCH_SIZE, ACTOR_LEARNING_RATE,
-                              CRITIC_LEARNING_RATE,
+                              CRITIC_LEARNING_RATE, UPDATE_EPOCHS,
+                              ACTOR_HIDDEN_SIZES, CRITIC_HIDDEN_SIZES,
                               DNN_TRAIN_ITER, DNN_EXPLORE, DNN_EXPLORE_ITER,
                               DNN_NOISE_SCALE_BEGIN, DNN_NOISE_SCALE_END,
                               DNN_DEBUG, DNN_DEBUG_INTERVAL)
@@ -278,12 +285,9 @@ def train_ddpg(result_id):
     result = Result.objects.get(pk=result_id)
     session = Result.objects.get(pk=result_id).session
     session_results = Result.objects.filter(session=session,
-                                            creation_time__lt=result.creation_time)
+                                            creation_time__lte=result.creation_time)
     result_info = {}
     result_info['newest_result_id'] = result_id
-    if len(session_results) == 0:
-        LOG.info('No previous result. Abort.')
-        return result_info
 
     # Extract data from result
     result = Result.objects.filter(pk=result_id)
@@ -332,13 +336,14 @@ def train_ddpg(result_id):
 
     # Update ddpg
     ddpg = DDPG(n_actions=knob_num, n_states=metric_num, alr=ACTOR_LEARNING_RATE,
-                clr=CRITIC_LEARNING_RATE, gamma=0, batch_size=DDPG_BATCH_SIZE)
+                clr=CRITIC_LEARNING_RATE, gamma=0, batch_size=DDPG_BATCH_SIZE,
+                a_hidden_sizes=ACTOR_HIDDEN_SIZES, c_hidden_sizes=CRITIC_HIDDEN_SIZES)
     if session.ddpg_actor_model and session.ddpg_critic_model:
         ddpg.set_model(session.ddpg_actor_model, session.ddpg_critic_model)
     if session.ddpg_reply_memory:
         ddpg.replay_memory.set(session.ddpg_reply_memory)
     ddpg.add_sample(normalized_metric_data, knob_data, reward, normalized_metric_data)
-    for _ in range(25):
+    for _ in range(UPDATE_EPOCHS):
         ddpg.update()
     session.ddpg_actor_model, session.ddpg_critic_model = ddpg.get_model()
     session.ddpg_reply_memory = ddpg.replay_memory.get()
@@ -362,7 +367,8 @@ def configuration_recommendation_ddpg(result_info):  # pylint: disable=invalid-n
     knob_num = len(knob_labels)
     metric_num = len(metric_data)
 
-    ddpg = DDPG(n_actions=knob_num, n_states=metric_num)
+    ddpg = DDPG(n_actions=knob_num, n_states=metric_num, a_hidden_sizes=ACTOR_HIDDEN_SIZES,
+                c_hidden_sizes=CRITIC_HIDDEN_SIZES)
     if session.ddpg_actor_model is not None and session.ddpg_critic_model is not None:
         ddpg.set_model(session.ddpg_actor_model, session.ddpg_critic_model)
     if session.ddpg_reply_memory is not None:
@@ -613,18 +619,35 @@ def configuration_recommendation(recommendation_input):
 
     elif algorithm == AlgorithmType.GPR:
         # default gpr model
-        model = GPRGD(length_scale=DEFAULT_LENGTH_SCALE,
-                      magnitude=DEFAULT_MAGNITUDE,
-                      max_train_size=MAX_TRAIN_SIZE,
-                      batch_size=BATCH_SIZE,
-                      num_threads=NUM_THREADS,
-                      learning_rate=DEFAULT_LEARNING_RATE,
-                      epsilon=DEFAULT_EPSILON,
-                      max_iter=MAX_ITER,
-                      sigma_multiplier=DEFAULT_SIGMA_MULTIPLIER,
-                      mu_multiplier=DEFAULT_MU_MULTIPLIER)
-        model.fit(X_scaled, y_scaled, X_min, X_max, ridge=DEFAULT_RIDGE)
-        res = model.predict(X_samples, constraint_helper=constraint_helper)
+        if USE_GPFLOW:
+            model_kwargs = {}
+            model_kwargs['model_learning_rate'] = HP_LEARNING_RATE
+            model_kwargs['model_maxiter'] = HP_MAX_ITER
+            opt_kwargs = {}
+            opt_kwargs['learning_rate'] = DEFAULT_LEARNING_RATE
+            opt_kwargs['maxiter'] = MAX_ITER
+            opt_kwargs['bounds'] = [X_min, X_max]
+            ucb_beta = 'get_beta_td'
+            opt_kwargs['ucb_beta'] = ucb.get_ucb_beta(ucb_beta, scale=DEFAULT_UCB_SCALE,
+                                                      t=i + 1., ndim=X_scaled.shape[1])
+            tf.reset_default_graph()
+            graph = tf.get_default_graph()
+            gpflow.reset_default_session(graph=graph)
+            m = gpr_models.create_model('BasicGP', X=X_scaled, y=y_scaled, **model_kwargs)
+            res = tf_optimize(m.model, X_samples, **opt_kwargs)
+        else:
+            model = GPRGD(length_scale=DEFAULT_LENGTH_SCALE,
+                          magnitude=DEFAULT_MAGNITUDE,
+                          max_train_size=MAX_TRAIN_SIZE,
+                          batch_size=BATCH_SIZE,
+                          num_threads=NUM_THREADS,
+                          learning_rate=DEFAULT_LEARNING_RATE,
+                          epsilon=DEFAULT_EPSILON,
+                          max_iter=MAX_ITER,
+                          sigma_multiplier=DEFAULT_SIGMA_MULTIPLIER,
+                          mu_multiplier=DEFAULT_MU_MULTIPLIER)
+            model.fit(X_scaled, y_scaled, X_min, X_max, ridge=DEFAULT_RIDGE)
+            res = model.predict(X_samples, constraint_helper=constraint_helper)
 
     best_config_idx = np.argmin(res.minl.ravel())
     best_config = res.minl_conf[best_config_idx, :]

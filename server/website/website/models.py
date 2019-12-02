@@ -196,29 +196,39 @@ class SessionKnobManager(models.Manager):
         return knob_dicts
 
     @staticmethod
-    def get_knob_min_max_tunability(session):
+    def get_knob_min_max_tunability(session, tunable_only=False):
         # Returns a dict of the knob
-        knobs = KnobCatalog.objects.filter(dbms=session.dbms)
-        knob_dicts = list(knobs.values())
+        filter_args = dict(session=session)
+        if tunable_only:
+            filter_args['tunable'] = True
+        session_knobs = SessionKnob.objects.filter(**filter_args).values(
+            'knob__name', 'tunable', 'minval', 'maxval')
+
         session_knob_dicts = {}
-        for i, _ in enumerate(knob_dicts):
-            if SessionKnob.objects.filter(session=session, knob=knobs[i]).exists():
-                new_knob = SessionKnob.objects.filter(session=session, knob=knobs[i])[0]
-                min_max_tunability = {"minval": new_knob.minval,
-                                      "maxval": new_knob.maxval,
-                                      "tunable": new_knob.tunable}
-                session_knob_dicts[new_knob.name] = min_max_tunability
+        for entry in session_knobs:
+            new_entry = dict(entry)
+            knob_name = new_entry.pop('knob__name')
+            session_knob_dicts[knob_name] = new_entry
         return session_knob_dicts
 
     @staticmethod
-    def set_knob_min_max_tunability(session, knob_dicts):
+    def set_knob_min_max_tunability(session, knob_dicts, cascade=True, disable_others=False):
         # Returns a dict of the knob
         session_knobs = SessionKnob.objects.filter(session=session)
         for session_knob in session_knobs:
-            if knob_dicts.__contains__(session_knob.name):
+            if session_knob.name in knob_dicts:
                 session_knob.minval = knob_dicts[session_knob.name]["minval"]
                 session_knob.maxval = knob_dicts[session_knob.name]["maxval"]
                 session_knob.tunable = knob_dicts[session_knob.name]["tunable"]
+                session_knob.save()
+                if cascade:
+                    knob = KnobCatalog.objects.get(name=session_knob.name,
+                                                   dbms=session_knob.session.dbms)
+                    knob.tunable = session_knob.tunable
+                    knob.save()
+            elif disable_others:
+                # Set all knobs not in knob_dicts to not tunable
+                session_knob.tunable = False
                 session_knob.save()
 
 

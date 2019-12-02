@@ -9,13 +9,15 @@ import datetime as dt
 import re
 from collections import OrderedDict
 
-from django.contrib.auth import login, logout
+from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.base import ContentFile
+from django.db.utils import IntegrityError
+from django.forms.models import model_to_dict
 from django.http import HttpResponse, QueryDict
 from django.shortcuts import redirect, render, get_object_or_404
 from django.template.context_processors import csrf
@@ -24,19 +26,19 @@ from django.urls import reverse, reverse_lazy
 from django.utils.datetime_safe import datetime
 from django.utils.timezone import now
 from django.views.decorators.csrf import csrf_exempt
-from django.forms.models import model_to_dict
 from pytz import timezone
 
+from . import utils
 from .db import parser, target_objectives
 from .forms import NewResultForm, ProjectForm, SessionForm, SessionKnobForm
-from .models import (BackupData, DBMSCatalog, KnobCatalog, KnobData, MetricCatalog,
-                     MetricData, Project, Result, Session, Workload, SessionKnob,
+from .models import (BackupData, DBMSCatalog, KnobCatalog, KnobData, MetricCatalog, User, Hardware,
+                     MetricData, Project, Result, Session, Workload, SessionKnob, PipelineRun,
                      PipelineData)
 from .tasks import (aggregate_target_results, map_workload, train_ddpg,
                     configuration_recommendation, configuration_recommendation_ddpg)
 from .types import (DBMSType, KnobUnitType, MetricType,
                     TaskType, VarType, WorkloadStatusType, AlgorithmType)
-from .utils import dump_debug_info, JSONUtil, LabelUtil, MediaUtil, TaskUtil
+from .utils import JSONUtil, LabelUtil, MediaUtil, TaskUtil
 from .settings import TIME_ZONE
 
 from .set_default_knobs import set_default_knobs
@@ -766,7 +768,7 @@ def download_next_config(request):
 @login_required(login_url=reverse_lazy('login'))
 def download_debug_info(request, project_id, session_id):  # pylint: disable=unused-argument
     session = Session.objects.get(pk=session_id)
-    content, filename = dump_debug_info(session, pretty_print=False)
+    content, filename = utils.dump_debug_info(session, pretty_print=False)
     file = ContentFile(content.getvalue())
     response = HttpResponse(file, content_type='application/x-gzip')
     response['Content-Length'] = file.size
@@ -781,7 +783,7 @@ def tuner_status_view(request, project_id, session_id, result_id):  # pylint: di
     tasks = TaskUtil.get_tasks(res.task_ids)
 
     overall_status, num_completed = TaskUtil.get_task_status(tasks)
-    if overall_status in ['PENDING', 'RECEIVED', 'STARTED']:
+    if overall_status in ['PENDING', 'RECEIVED', 'STARTED', None]:
         completion_time = 'N/A'
         total_runtime = 'N/A'
     else:
@@ -1021,13 +1023,21 @@ def give_result(request, upload_code):  # pylint: disable=unused-argument
     overall_status, num_completed = TaskUtil.get_task_status(tasks)
 
     if overall_status == 'SUCCESS':
-        next_config = latest_result.next_configuration
-        if not next_config:
+        if not latest_result.next_configuration:
+            # If the task status was incomplete when we first queried latest_result
+            # but succeeded before the call to TaskUtil.get_task_status() finished
+            # then latest_result is stale and must be updated.
+            LOG.debug("Updating stale result (pk=%s)", latest_result.pk)
+            latest_result = Result.objects.get(id=latest_result.pk)
+
+        if not latest_result.next_configuration:
+            LOG.warning("Failed to get the next configuration from the latest result: %s",
+                        model_to_dict(latest_result))
             overall_status = 'FAILURE'
             response = _failed_response(latest_result, tasks, num_completed, overall_status,
                                         'Failed to get the next configuration.')
         else:
-            response = HttpResponse(JSONUtil.dumps(next_config),
+            response = HttpResponse(JSONUtil.dumps(latest_result.next_configuration),
                                     content_type='application/json')
 
     elif overall_status in ('FAILURE', 'REVOKED', 'RETRY'):
@@ -1049,7 +1059,7 @@ def get_debug_info(request, upload_code):  # pylint: disable=unused-argument
         LOG.warning("Invalid upload code: %s", upload_code)
         return HttpResponse("Invalid upload code: " + upload_code, status=400)
 
-    content, filename = dump_debug_info(session, pretty_print=pprint)
+    content, filename = utils.dump_debug_info(session, pretty_print=pprint)
     file = ContentFile(content.getvalue())
     response = HttpResponse(file, content_type='application/x-gzip')
     response['Content-Length'] = file.size
@@ -1063,3 +1073,260 @@ def train_ddpg_loops(request, session_id):  # pylint: disable=unused-argument
     for result in results:
         train_ddpg(result.pk)
     return HttpResponse()
+
+
+@csrf_exempt
+def alt_create_user(request):
+    response = dict(created=False, error=None, user=None)
+    if request.method != 'POST':
+        err_msg = "Request was not a post!"
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    data = {k: v[0] for k, v in request.POST.lists()}
+    missing = [k for k in ('username', 'password') if k not in data]
+    if missing:
+        err_msg = "Request is missing required data: {}".format(', '.join(missing))
+        LOG.warning(err_msg)
+        response.update(error=err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    user, created = utils.create_user(**data)
+    response.update(user=user, created=created)
+    if created:
+        LOG.info("Successfully created user '%s': %s", data['username'], user)
+        status = 200
+    else:
+        err_msg = "ERROR: User '{}' already exists: {}".format(data['username'], user)
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        status = 400
+
+    response['user'] = model_to_dict(response['user'])
+    return HttpResponse(JSONUtil.dumps(response), status=status)
+
+
+@csrf_exempt
+def alt_delete_user(request):
+    response = dict(deleted=False, error=None, delete_info=None)
+    if request.method != 'POST':
+        err_msg = "Request was not a post!"
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    data = {k: v[0] for k, v in request.POST.lists()}
+    missing = [k for k in ('username',) if k not in data]
+    if missing:
+        err_msg = "Request is missing required data: {}".format(', '.join(missing))
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    delete_info, deleted = utils.delete_user(**data)
+    response.update(deleted=deleted, delete_info=delete_info)
+    if deleted:
+        LOG.info("Successfully deleted user '%s': %s", data['username'], delete_info)
+        status = 200
+    else:
+        err_msg = "User '{}' does not exist".format(data['username'])
+        LOG.warning(err_msg)
+        response.update(error=err_msg)
+        status = 400
+
+    return HttpResponse(JSONUtil.dumps(response), status=status)
+
+
+@csrf_exempt
+def alt_create_or_edit_project(request):
+    response = dict(created=False, error=None, project=None)
+    if request.method != 'POST':
+        err_msg = "Request was not a post!"
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    data = {k: v[0] for k, v in request.POST.lists()}
+    missing = [k for k in ('username', 'password', 'name') if k not in data]
+    if missing:
+        err_msg = "Request is missing required data: {}".format(', '.join(missing))
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    username = data.pop('username')
+    password = data.pop('password')
+    user = authenticate(User, username=username, password=password)
+    if not user:
+        err_msg = "ERROR: Unable to authenticate user '{}'.".format(username)
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    project_name = data.pop('name')
+    ts = now()
+
+    if request.path == reverse('backdoor_create_project'):
+        try:
+            project = Project.objects.create(user=user, name=project_name, last_update=ts,
+                                             creation_time=ts, **data)
+        except IntegrityError:
+            err_msg = "ERROR: Project '{}' already exists.".format(project_name)
+            project = Project.objects.get(user=user, name=project_name)
+            response.update(error=err_msg, project=model_to_dict(project))
+            LOG.warning(err_msg)
+            return HttpResponse(JSONUtil.dumps(response), status=400)
+    else:
+        project = get_object_or_404(Project, name=project_name, user=user)
+        for k, v in data.items():
+            setattr(project, k, v)
+        project.last_update = ts
+        project.save()
+
+    response.update(created=True, project=model_to_dict(project))
+    return HttpResponse(JSONUtil.dumps(response))
+
+
+@csrf_exempt
+def alt_create_or_edit_session(request):
+    response = dict(created=False, error=None, session=None)
+    if request.method != 'POST':
+        err_msg = "Request was not a post!"
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    data = {k: v[0] for k, v in request.POST.lists()}
+    if 'hardware' in data:
+        err_msg = "Custom hardware objects are not supported."
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    required_fields = ('username', 'password', 'project_name', 'name', 'dbms_type',
+                       'dbms_version')
+    missing = [k for k in required_fields if k not in data]
+    if missing:
+        err_msg = "Request is missing required data: {}".format(', '.join(missing))
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    username = data.pop('username')
+    password = data.pop('password')
+    user = authenticate(User, username=username, password=password)
+    if not user:
+        err_msg = "ERROR: Unable to authenticate user '{}'.".format(username)
+        response.update(error=err_msg)
+        LOG.warning(err_msg)
+        return HttpResponse(JSONUtil.dumps(response), status=400)
+
+    project = get_object_or_404(Project, name=data.pop('project_name'), user=user)
+    dbms_type = DBMSType.type(data.pop('dbms_type'))
+    dbms = get_object_or_404(DBMSCatalog, type=dbms_type, version=data.pop('dbms_version'))
+
+    session_name = data.pop('name')
+    if 'algorithm' in data:
+        data['algorithm'] = AlgorithmType.type(data['algorithm'])
+    session_knobs = data.pop('session_knobs', None)
+    disable_others = data.pop('disable_others', False)
+    ts = now()
+
+    if request.path == reverse('backdoor_create_session'):
+        hardware, _ = Hardware.objects.get_or_create(pk=1)
+        upload_code = data.pop('upload_code', None) or MediaUtil.upload_code_generator()
+        try:
+            session = Session.objects.create(user=user, project=project, dbms=dbms,
+                                             name=session_name, hardware=hardware,
+                                             upload_code=upload_code, creation_time=ts,
+                                             last_update=ts, **data)
+        except IntegrityError:
+            err_msg = "ERROR: Project '{}' already exists.".format(session_name)
+            session = Session.objects.get(user=user, project=project, name=session_name)
+            response.update(error=err_msg, project=model_to_dict(session))
+            LOG.warning(err_msg)
+            return HttpResponse(JSONUtil.dumps(response), status=400)
+
+        set_default_knobs(session)
+    else:
+        session = get_object_or_404(Session, name=session_name, project=project, user=user)
+        for k, v in data.items():
+            setattr(session, k, v)
+        session.last_update = ts
+        session.save()
+
+    if session_knobs:
+        session_knobs = JSONUtil.loads(session_knobs)
+        SessionKnob.objects.set_knob_min_max_tunability(session, session_knobs,
+                                                        disable_others=disable_others)
+
+    res = model_to_dict(session)
+    res['dbms_id'] = res['dbms']
+    res['dbms'] = session.dbms.full_name
+    res['hardware_id'] = res['hardware']
+    res['hardware'] = model_to_dict(session.hardware)
+    res['algorithm'] = AlgorithmType.name(res['algorithm'])
+    sk = SessionKnob.objects.get_knobs_for_session(session)
+    sess_knobs = []
+    for knob in sk:
+        sess_knobs.append(dict(
+            minval=knob['minval'],
+            maxval=knob['maxval'],
+            tunable=knob['tunable']))
+    res['session_knobs'] = sess_knobs
+    response.update(created=True, session=res)
+    return HttpResponse(JSONUtil.dumps(response))
+
+
+# integration test
+@csrf_exempt
+def pipeline_data_ready(request):  # pylint: disable=unused-argument
+    LOG.debug("Latest pipeline run: %s", PipelineRun.objects.get_latest())
+    if PipelineRun.objects.get_latest() is None:
+        response = "Pipeline data ready: False"
+    else:
+        response = "Pipeline data ready: True"
+    return HttpResponse(response)
+
+
+# integration test
+@csrf_exempt
+def create_test_website(request):  # pylint: disable=unused-argument
+    if User.objects.filter(username='ottertune_test_user').exists():
+        User.objects.filter(username='ottertune_test_user').delete()
+    if Hardware.objects.filter(pk=1).exists():
+        test_hardware = Hardware.objects.get(pk=1)
+    else:
+        test_hardware = Hardware.objects.create(pk=1)
+
+    test_user = User.objects.create_user(username='ottertune_test_user',
+                                         password='ottertune_test_user')
+    test_project = Project.objects.create(user=test_user, name='ottertune_test_project',
+                                          creation_time=now(), last_update=now())
+    # create no tuning session
+    s1 = Session.objects.create(name='test_session_no_tuning', tuning_session='no_tuning_session',
+                                dbms_id=1, hardware=test_hardware, project=test_project,
+                                creation_time=now(), last_update=now(), user=test_user,
+                                upload_code='ottertuneTestNoTuning')
+    set_default_knobs(s1)
+    # create gpr session
+    s2 = Session.objects.create(name='test_session_gpr', tuning_session='tuning_session',
+                                dbms_id=1, hardware=test_hardware, project=test_project,
+                                creation_time=now(), last_update=now(), algorithm=AlgorithmType.GPR,
+                                upload_code='ottertuneTestTuningGPR', user=test_user)
+    set_default_knobs(s2)
+    # create dnn session
+    s3 = Session.objects.create(name='test_session_dnn', tuning_session='tuning_session',
+                                dbms_id=1, hardware=test_hardware, project=test_project,
+                                creation_time=now(), last_update=now(), algorithm=AlgorithmType.DNN,
+                                upload_code='ottertuneTestTuningDNN', user=test_user)
+    set_default_knobs(s3)
+    # create ddpg session
+    s4 = Session.objects.create(name='test_session_ddpg', tuning_session='tuning_session',
+                                dbms_id=1, hardware=test_hardware, project=test_project,
+                                creation_time=now(), last_update=now(), user=test_user,
+                                upload_code='ottertuneTestTuningDDPG', algorithm=AlgorithmType.DDPG)
+    set_default_knobs(s4)
+    response = HttpResponse("Success: create test website successfully")
+    return response

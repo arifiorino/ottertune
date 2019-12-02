@@ -20,43 +20,31 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 import requests
-from fabric.api import env, local, task, lcd
+from fabric.api import env, lcd, local, settings, show, task
 from fabric.state import output as fabric_output
 
-# Fabric environment settings
-env.hosts = ['localhost']
+from utils import (file_exists, get, get_content, load_driver_conf, parse_bool,
+                   put, run, run_sql_script, sudo, FabricException)
+
+# Loads the driver config file (defaults to driver_config.py)
+dconf = load_driver_conf()  # pylint: disable=invalid-name
+
+# Fabric settings
 fabric_output.update({
     'running': True,
     'stdout': True,
 })
+env.abort_exception = FabricException
+env.hosts = [dconf.LOGIN]
 
-# intervals of restoring the databse
-RELOAD_INTERVAL = 10
-# maximum disk usage
-MAX_DISK_USAGE = 90
-# Postgres datadir
-PG_DATADIR = '/var/lib/postgresql/9.6/main'
+# Create local directories
+for _d in (dconf.RESULT_DIR, dconf.LOG_DIR, dconf.TEMP_DIR):
+    os.makedirs(_d, exist_ok=True)
 
-# Load config
-with open('driver_config.json', 'r') as _f:
-    CONF = {k: os.path.expanduser(v) if isinstance(v, str) and v.startswith('~') else v
-            for k, v in json.load(_f).items()}
-
-# Create output directories
-for _dir in (CONF['database_save_path'], CONF['log_path'], CONF['save_path'],
-             CONF['lhs_save_path']):
-    os.makedirs(_dir, exist_ok=True)
-
-# Define paths
-CONF['driver_log'] = os.path.join(CONF['log_path'], 'driver.log')
-CONF['oltpbench_log'] = os.path.join(CONF['log_path'], 'oltpbench.log')
-CONF['controller_log'] = os.path.join(CONF['log_path'], 'controller.log')
-CONF['controller_config'] = os.path.join(CONF['controller_home'], 'config',
-                                         '{}_config.json'.format(CONF['database_type']))
 
 # Configure logging
 LOG = logging.getLogger(__name__)
-LOG.setLevel(logging.DEBUG)
+LOG.setLevel(getattr(logging, dconf.LOG_LEVEL, logging.DEBUG))
 Formatter = logging.Formatter(  # pylint: disable=invalid-name
     fmt='%(asctime)s [%(funcName)s:%(lineno)03d] %(levelname)-5s: %(message)s',
     datefmt='%m-%d-%Y %H:%M:%S')
@@ -64,24 +52,18 @@ ConsoleHandler = logging.StreamHandler()  # pylint: disable=invalid-name
 ConsoleHandler.setFormatter(Formatter)
 LOG.addHandler(ConsoleHandler)
 FileHandler = RotatingFileHandler(  # pylint: disable=invalid-name
-    CONF['driver_log'], maxBytes=50000, backupCount=2)
+    dconf.DRIVER_LOG, maxBytes=50000, backupCount=2)
 FileHandler.setFormatter(Formatter)
 LOG.addHandler(FileHandler)
 
 
-def _parse_bool(value):
-    if not isinstance(value, bool):
-        value = str(value).lower() == 'true'
-    return value
-
-
 @task
 def check_disk_usage():
-    partition = CONF['database_disk']
+    partition = dconf.DATABASE_DISK
     disk_use = 0
     if partition:
         cmd = "df -h {}".format(partition)
-        out = local(cmd, capture=True).splitlines()[1]
+        out = run(cmd).splitlines()[1]
         m = re.search(r'\d+(?=%)', out)
         if m:
             disk_use = int(m.group(0))
@@ -91,63 +73,89 @@ def check_disk_usage():
 
 @task
 def check_memory_usage():
-    cmd = 'free -m -h'
-    local(cmd)
+    run('free -m -h')
 
 
 @task
 def create_controller_config():
-    if CONF['database_type'] == 'postgres':
-        dburl_fmt = 'jdbc:postgresql://localhost:5432/{db}'.format
-    elif CONF['database_type'] == 'oracle':
-        dburl_fmt = 'jdbc:oracle:thin:@localhost:1521:{db}'.format
+    if dconf.DB_TYPE == 'postgres':
+        dburl_fmt = 'jdbc:postgresql://{host}:{port}/{db}'.format
+    elif dconf.DB_TYPE == 'oracle':
+        dburl_fmt = 'jdbc:oracle:thin:@{host}:{port}:{db}'.format
     else:
-        raise Exception("Database Type {} Not Implemented !".format(CONF['database_type']))
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
 
     config = dict(
-        database_type=CONF['database_type'],
-        database_url=dburl_fmt(db=CONF['database_name']),
-        username=CONF['username'],
-        password=CONF['password'],
+        database_type=dconf.DB_TYPE,
+        database_url=dburl_fmt(host=dconf.DB_HOST, port=dconf.DB_PORT, db=dconf.DB_NAME),
+        username=dconf.DB_USER,
+        password=dconf.DB_PASSWORD,
         upload_code='DEPRECATED',
         upload_url='DEPRECATED',
-        workload_name=CONF['oltpbench_workload']
+        workload_name=dconf.OLTPBENCH_BENCH
     )
 
-    with open(CONF['controller_config'], 'w') as f:
+    with open(dconf.CONTROLLER_CONFIG, 'w') as f:
         json.dump(config, f, indent=2)
 
 
 @task
 def restart_database():
-    if CONF['database_type'] == 'postgres':
-        cmd = 'sudo -u postgres pg_ctl -D {} -w restart'.format(PG_DATADIR)
-    elif CONF['database_type'] == 'oracle':
-        cmd = 'sh oracleScripts/shutdownOracle.sh && sh oracleScripts/startupOracle.sh'
+    if dconf.DB_TYPE == 'postgres':
+        if dconf.HOST_CONN == 'docker':
+            # Restarting the docker container here is the cleanest way to do it
+            # becaues there's no init system running and the only process running
+            # in the container is postgres itself
+            local('docker restart {}'.format(dconf.CONTAINER_NAME))
+        else:
+            sudo('pg_ctl -D {} -w -t 600 restart -m fast'.format(
+                dconf.PG_DATADIR), user=dconf.ADMIN_USER, capture=False)
+    elif dconf.DB_TYPE == 'oracle':
+        run_sql_script('restartOracle.sh')
     else:
-        raise Exception("Database Type {} Not Implemented !".format(CONF['database_type']))
-    local(cmd)
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
 
 
 @task
 def drop_database():
-    if CONF['database_type'] == 'postgres':
-        cmd = "PGPASSWORD={} dropdb -e --if-exists {} -U {}".\
-              format(CONF['password'], CONF['database_name'], CONF['username'])
+    if dconf.DB_TYPE == 'postgres':
+        run("PGPASSWORD={} dropdb -e --if-exists {} -U {} -h {}".format(
+            dconf.DB_PASSWORD, dconf.DB_NAME, dconf.DB_USER, dconf.DB_HOST))
     else:
-        raise Exception("Database Type {} Not Implemented !".format(CONF['database_type']))
-    local(cmd)
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
 
 
 @task
 def create_database():
-    if CONF['database_type'] == 'postgres':
-        cmd = "PGPASSWORD={} createdb -e {} -U {}".\
-              format(CONF['password'], CONF['database_name'], CONF['username'])
+    if dconf.DB_TYPE == 'postgres':
+        run("PGPASSWORD={} createdb -e {} -U {} -h {}".format(
+            dconf.DB_PASSWORD, dconf.DB_NAME, dconf.DB_USER, dconf.DB_HOST))
     else:
-        raise Exception("Database Type {} Not Implemented !".format(CONF['database_type']))
-    local(cmd)
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
 
+
+@task
+def create_user():
+    if dconf.DB_TYPE == 'postgres':
+        sql = "CREATE USER {} SUPERUSER PASSWORD '{}';".format(dconf.DB_USER, dconf.DB_PASSWORD)
+        run("PGPASSWORD={} psql -c \\\"{}\\\" -U postgres -h {}".format(
+            dconf.DB_PASSWORD, sql, dconf.DB_HOST))
+    elif dconf.DB_TYPE == 'oracle':
+        run_sql_script('createUser.sh', dconf.DB_USER, dconf.DB_PASSWORD)
+    else:
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
+
+
+@task
+def drop_user():
+    if dconf.DB_TYPE == 'postgres':
+        sql = "DROP USER IF EXISTS {};".format(dconf.DB_USER)
+        run("PGPASSWORD={} psql -c \\\"{}\\\" -U postgres -h {}".format(
+            dconf.DB_PASSWORD, sql, dconf.DB_HOST))
+    elif dconf.DB_TYPE == 'oracle':
+        run_sql_script('dropUser.sh', dconf.DB_USER)
+    else:
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
 
 @task
 def reset_conf():
@@ -159,7 +167,9 @@ def change_conf(next_conf=None):
     signal = "# configurations recommended by ottertune:\n"
     next_conf = next_conf or {}
 
-    with open(CONF['database_conf'], 'r') as f:
+    tmp_conf_in = os.path.join(dconf.TEMP_DIR, os.path.basename(dconf.DB_CONF) + '.in')
+    get(dconf.DB_CONF, tmp_conf_in)
+    with open(tmp_conf_in, 'r') as f:
         lines = f.readlines()
 
     if signal not in lines:
@@ -167,6 +177,11 @@ def change_conf(next_conf=None):
 
     signal_idx = lines.index(signal)
     lines = lines[0:signal_idx + 1]
+    if dconf.BASE_DB_CONF:
+        assert isinstance(dconf.BASE_DB_CONF, dict), \
+            (type(dconf.BASE_DB_CONF), dconf.BASE_DB_CONF)
+        base_conf = ['{} = {}\n'.format(*c) for c in sorted(dconf.BASE_DB_CONF.items())]
+        lines.extend(base_conf)
 
     if isinstance(next_conf, str):
         with open(next_conf, 'r') as f:
@@ -178,60 +193,61 @@ def change_conf(next_conf=None):
     assert isinstance(recommendation, dict)
 
     for name, value in recommendation.items():
-        if CONF['database_type'] == 'oracle' and isinstance(value, str):
+        if dconf.DB_TYPE == 'oracle' and isinstance(value, str):
             value = value.strip('B')
         lines.append('{} = {}\n'.format(name, value))
     lines.append('\n')
 
-    tmpconf = 'tmp_' + os.path.basename(CONF['database_conf'])
-    with open(tmpconf, 'w') as f:
+    tmp_conf_out = os.path.join(dconf.TEMP_DIR, os.path.basename(dconf.DB_CONF) + '.out')
+    with open(tmp_conf_out, 'w') as f:
         f.write(''.join(lines))
 
-    local('sudo cp {0} {0}.ottertune.bak'.format(CONF['database_conf']))
-    local('sudo mv {} {}'.format(tmpconf, CONF['database_conf']))
+    sudo('cp {0} {0}.ottertune.bak'.format(dconf.DB_CONF))
+    put(tmp_conf_out, dconf.DB_CONF, use_sudo=False)
+    local('rm -f {} {}'.format(tmp_conf_in, tmp_conf_out))
 
 
 @task
 def load_oltpbench():
     cmd = "./oltpbenchmark -b {} -c {} --create=true --load=true".\
-          format(CONF['oltpbench_workload'], CONF['oltpbench_config'])
-    with lcd(CONF['oltpbench_home']):  # pylint: disable=not-context-manager
+          format(dconf.OLTPBENCH_BENCH, dconf.OLTPBENCH_CONFIG)
+    with lcd(dconf.OLTPBENCH_HOME):  # pylint: disable=not-context-manager
         local(cmd)
 
 
 @task
 def run_oltpbench():
     cmd = "./oltpbenchmark -b {} -c {} --execute=true -s 5 -o outputfile".\
-          format(CONF['oltpbench_workload'], CONF['oltpbench_config'])
-    with lcd(CONF['oltpbench_home']):  # pylint: disable=not-context-manager
+          format(dconf.OLTPBENCH_BENCH, dconf.OLTPBENCH_CONFIG)
+    with lcd(dconf.OLTPBENCH_HOME):  # pylint: disable=not-context-manager
         local(cmd)
 
 
 @task
 def run_oltpbench_bg():
     cmd = "./oltpbenchmark -b {} -c {} --execute=true -s 5 -o outputfile > {} 2>&1 &".\
-          format(CONF['oltpbench_workload'], CONF['oltpbench_config'], CONF['oltpbench_log'])
-    with lcd(CONF['oltpbench_home']):  # pylint: disable=not-context-manager
+          format(dconf.OLTPBENCH_BENCH, dconf.OLTPBENCH_CONFIG, dconf.OLTPBENCH_LOG)
+    with lcd(dconf.OLTPBENCH_HOME):  # pylint: disable=not-context-manager
         local(cmd)
 
 
 @task
 def run_controller():
-    if not os.path.exists(CONF['controller_config']):
+    if not os.path.exists(dconf.CONTROLLER_CONFIG):
         create_controller_config()
     cmd = 'gradle run -PappArgs="-c {} -d output/" --no-daemon > {}'.\
-          format(CONF['controller_config'], CONF['controller_log'])
-    with lcd(CONF['controller_home']):  # pylint: disable=not-context-manager
+          format(dconf.CONTROLLER_CONFIG, dconf.CONTROLLER_LOG)
+    with lcd(dconf.CONTROLLER_HOME):  # pylint: disable=not-context-manager
         local(cmd)
 
 
 @task
 def signal_controller():
-    pidfile = os.path.join(CONF['controller_home'], 'pid.txt')
+    pidfile = os.path.join(dconf.CONTROLLER_HOME, 'pid.txt')
     with open(pidfile, 'r') as f:
         pid = int(f.read())
-    cmd = 'sudo kill -2 {}'.format(pid)
-    with lcd(CONF['controller_home']):  # pylint: disable=not-context-manager
+    cmd = 'kill -2 {}'.format(pid)
+    with lcd(dconf.CONTROLLER_HOME):  # pylint: disable=not-context-manager
         local(cmd)
 
 
@@ -240,8 +256,8 @@ def save_dbms_result():
     t = int(time.time())
     files = ['knobs.json', 'metrics_after.json', 'metrics_before.json', 'summary.json']
     for f_ in files:
-        srcfile = os.path.join(CONF['controller_home'], 'output', f_)
-        dstfile = os.path.join(CONF['save_path'], '{}__{}'.format(t, f_))
+        srcfile = os.path.join(dconf.CONTROLLER_HOME, 'output', f_)
+        dstfile = os.path.join(dconf.RESULT_DIR, '{}__{}'.format(t, f_))
         local('cp {} {}'.format(srcfile, dstfile))
     return t
 
@@ -250,21 +266,25 @@ def save_dbms_result():
 def save_next_config(next_config, t=None):
     if not t:
         t = int(time.time())
-    with open(os.path.join(CONF['save_path'], '{}__next_config.json'.format(t)), 'w') as f:
+    with open(os.path.join(dconf.RESULT_DIR, '{}__next_config.json'.format(t)), 'w') as f:
         json.dump(next_config, f, indent=2)
     return t
 
 
 @task
 def free_cache():
-    cmd = 'sync; sudo bash -c "echo 1 > /proc/sys/vm/drop_caches"'
-    local(cmd)
+    if dconf.HOST_CONN != 'docker':
+        with show('everything'), settings(warn_only=True):  # pylint: disable=not-context-manager
+            res = sudo("sh -c \"echo 3 > /proc/sys/vm/drop_caches\"")
+            if res.failed:
+                LOG.error('%s (return code %s)', res.stderr.strip(), res.return_code)
 
 
 @task
-def upload_result(result_dir=None, prefix=None):
-    result_dir = result_dir or os.path.join(CONF['controller_home'], 'output')
+def upload_result(result_dir=None, prefix=None, upload_code=None):
+    result_dir = result_dir or os.path.join(dconf.CONTROLLER_HOME, 'output')
     prefix = prefix or ''
+    upload_code = upload_code or dconf.UPLOAD_CODE
 
     files = {}
     for base in ('summary', 'knobs', 'metrics_before', 'metrics_after'):
@@ -272,43 +292,43 @@ def upload_result(result_dir=None, prefix=None):
 
         # Replaces the true db version with the specified version to allow for
         # testing versions not officially supported by OtterTune
-        if base == 'summary' and 'override_database_version' in CONF and \
-                CONF['override_database_version']:
+        if base == 'summary' and dconf.OVERRIDE_DB_VERSION:
             with open(fpath, 'r') as f:
                 summary = json.load(f)
             summary['real_database_version'] = summary['database_version']
-            summary['database_version'] = CONF['override_database_version']
+            summary['database_version'] = dconf.OVERRIDE_DB_VERSION
             with open(fpath, 'w') as f:
                 json.dump(summary, f, indent=1)
 
         files[base] = open(fpath, 'rb')
 
-    response = requests.post(CONF['upload_url'] + '/new_result/', files=files,
-                             data={'upload_code': CONF['upload_code']})
+    response = requests.post(dconf.WEBSITE_URL + '/new_result/', files=files,
+                             data={'upload_code': upload_code})
     if response.status_code != 200:
         raise Exception('Error uploading result.\nStatus: {}\nMessage: {}\n'.format(
-            response.status_code, response.content))
+            response.status_code, get_content(response)))
 
     for f in files.values():  # pylint: disable=not-an-iterable
         f.close()
 
-    LOG.info(response.content)
+    LOG.info(get_content(response))
 
     return response
 
 
 @task
-def get_result(max_time_sec=180, interval_sec=5):
+def get_result(max_time_sec=180, interval_sec=5, upload_code=None):
     max_time_sec = int(max_time_sec)
     interval_sec = int(interval_sec)
-    url = CONF['upload_url'] + '/query_and_get/' + CONF['upload_code']
+    upload_code = upload_code or dconf.UPLOAD_CODE
+    url = dconf.WEBSITE_URL + '/query_and_get/' + upload_code
     elapsed = 0
     response_dict = None
     response = ''
 
     while elapsed <= max_time_sec:
         rsp = requests.get(url)
-        response = rsp.content.decode()
+        response = get_content(rsp)
         assert response != 'null'
 
         LOG.debug('%s [status code: %d, content_type: %s, elapsed: %ds]', response,
@@ -349,8 +369,8 @@ def get_result(max_time_sec=180, interval_sec=5):
 
 @task
 def download_debug_info(pprint=False):
-    pprint = _parse_bool(pprint)
-    url = '{}/dump/{}'.format(CONF['upload_url'], CONF['upload_code'])
+    pprint = parse_bool(pprint)
+    url = '{}/dump/{}'.format(dconf.WEBSITE_URL, dconf.UPLOAD_CODE)
     params = {'pp': int(True)} if pprint else {}
     rsp = requests.get(url, params=params)
 
@@ -371,14 +391,13 @@ def download_debug_info(pprint=False):
 
 @task
 def add_udf():
-    cmd = 'sudo python3 ./LatencyUDF.py ../controller/output/'
-    local(cmd)
+    local('python3 ./LatencyUDF.py ../controller/output/')
 
 
 @task
-def upload_batch(result_dir=None, sort=True):
-    result_dir = result_dir or CONF['save_path']
-    sort = _parse_bool(sort)
+def upload_batch(result_dir=None, sort=True, upload_code=None):
+    result_dir = result_dir or dconf.RESULT_DIR
+    sort = parse_bool(sort)
     results = glob.glob(os.path.join(result_dir, '*__summary.json'))
     if sort:
         results = sorted(results)
@@ -389,57 +408,76 @@ def upload_batch(result_dir=None, sort=True):
         prefix = os.path.basename(result)
         prefix_len = os.path.basename(result).find('_') + 2
         prefix = prefix[:prefix_len]
-        upload_result(result_dir=result_dir, prefix=prefix)
+        upload_result(result_dir=result_dir, prefix=prefix, upload_code=upload_code)
         LOG.info('Uploaded result %d/%d: %s__*.json', i + 1, count, prefix)
 
 
 @task
 def dump_database():
-    db_file_path = os.path.join(CONF['database_save_path'], CONF['database_name'] + '.dump')
-    if os.path.exists(db_file_path):
-        LOG.info('%s already exists ! ', db_file_path)
+    dumpfile = os.path.join(dconf.DB_DUMP_DIR, dconf.DB_NAME + '.dump')
+    if not dconf.ORACLE_FLASH_BACK and file_exists(dumpfile):
+        LOG.info('%s already exists ! ', dumpfile)
         return False
+
+    if dconf.ORACLE_FLASH_BACK:
+        LOG.info('create restore point %s for database %s in %s', dconf.RESTORE_POINT,
+                 dconf.DB_NAME, dconf.RECOVERY_FILE_DEST)
     else:
-        LOG.info('Dump database %s to %s', CONF['database_name'], db_file_path)
-        # You must create a directory named dpdata through sqlplus in your Oracle database
-        if CONF['database_type'] == 'oracle':
-            cmd = 'expdp {}/{}@{} schemas={} dumpfile={}.dump DIRECTORY=dpdata'.format(
-                'c##tpcc', 'oracle', 'orcldb', 'c##tpcc', 'orcldb')
-        elif CONF['database_type'] == 'postgres':
-            cmd = 'PGPASSWORD={} pg_dump -U {} -F c -d {} > {}'.format(CONF['password'],
-                                                                       CONF['username'],
-                                                                       CONF['database_name'],
-                                                                       db_file_path)
+        LOG.info('Dump database %s to %s', dconf.DB_NAME, dumpfile)
+
+    if dconf.DB_TYPE == 'oracle':
+        if dconf.ORACLE_FLASH_BACK:
+            run_sql_script('createRestore.sh', dconf.RESTORE_POINT,
+                           dconf.RECOVERY_FILE_DEST_SIZE, dconf.RECOVERY_FILE_DEST)
         else:
-            raise Exception("Database Type {} Not Implemented !".format(CONF['database_type']))
-        local(cmd)
-        return True
+            run_sql_script('dumpOracle.sh', dconf.DB_USER, dconf.DB_PASSWORD,
+                           dconf.DB_NAME, dconf.DB_DUMP_DIR)
+
+    elif dconf.DB_TYPE == 'postgres':
+        run('PGPASSWORD={} pg_dump -U {} -h {} -F c -d {} > {}'.format(
+            dconf.DB_PASSWORD, dconf.DB_USER, dconf.DB_HOST, dconf.DB_NAME,
+            dumpfile))
+    else:
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
+    return True
+
+
+@task
+def clean_recovery():
+    run_sql_script('removeRestore.sh', dconf.RESTORE_POINT)
+    cmds = ("""rman TARGET / <<EOF\nDELETE ARCHIVELOG ALL;\nexit\nEOF""")
+    run(cmds)
 
 
 @task
 def restore_database():
-    if CONF['database_type'] == 'oracle':
-        # You must create a directory named dpdata through sqlplus in your Oracle database
-        # The following script assumes such directory exists.
-        # You may want to modify the username, password, and dump file name in the script
-        cmd = 'sh oracleScripts/restoreOracle.sh'
-    elif CONF['database_type'] == 'postgres':
-        db_file_path = '{}/{}.dump'.format(CONF['database_save_path'], CONF['database_name'])
+    dumpfile = os.path.join(dconf.DB_DUMP_DIR, dconf.DB_NAME + '.dump')
+    if not dconf.ORACLE_FLASH_BACK and not file_exists(dumpfile):
+        raise FileNotFoundError("Database dumpfile '{}' does not exist!".format(dumpfile))
+
+    LOG.info('Start restoring database')
+    if dconf.DB_TYPE == 'oracle':
+        if dconf.ORACLE_FLASH_BACK:
+            run_sql_script('flashBack.sh', dconf.RESTORE_POINT)
+            clean_recovery()
+        else:
+            drop_user()
+            create_user()
+            run_sql_script('restoreOracle.sh', dconf.DB_USER, dconf.DB_NAME)
+    elif dconf.DB_TYPE == 'postgres':
         drop_database()
         create_database()
-        cmd = 'PGPASSWORD={} pg_restore -U {} -n public -j 8 -F c -d {} {}'.\
-              format(CONF['password'], CONF['username'], CONF['database_name'], db_file_path)
+        run('PGPASSWORD={} pg_restore -U {} -h {} -n public -j 8 -F c -d {} {}'.format(
+            dconf.DB_PASSWORD, dconf.DB_USER, dconf.DB_HOST, dconf.DB_NAME, dumpfile))
     else:
-        raise Exception("Database Type {} Not Implemented !".format(CONF['database_type']))
-    LOG.info('Start restoring database')
-    local(cmd)
+        raise Exception("Database Type {} Not Implemented !".format(dconf.DB_TYPE))
     LOG.info('Finish restoring database')
 
 
 def _ready_to_start_oltpbench():
     ready = False
-    if os.path.exists(CONF['controller_log']):
-        with open(CONF['controller_log'], 'r') as f:
+    if os.path.exists(dconf.CONTROLLER_LOG):
+        with open(dconf.CONTROLLER_LOG, 'r') as f:
             content = f.read()
         ready = 'Output the process pid to' in content
     return ready
@@ -447,41 +485,31 @@ def _ready_to_start_oltpbench():
 
 def _ready_to_start_controller():
     ready = False
-    if os.path.exists(CONF['oltpbench_log']):
-        with open(CONF['oltpbench_log'], 'r') as f:
+    if os.path.exists(dconf.OLTPBENCH_LOG):
+        with open(dconf.OLTPBENCH_LOG, 'r') as f:
             content = f.read()
         ready = 'Warmup complete, starting measurements' in content
     return ready
 
 
 def _ready_to_shut_down_controller():
-    pidfile = os.path.join(CONF['controller_home'], 'pid.txt')
+    pidfile = os.path.join(dconf.CONTROLLER_HOME, 'pid.txt')
     ready = False
-    if os.path.exists(pidfile) and os.path.exists(CONF['oltpbench_log']):
-        with open(CONF['oltpbench_log'], 'r') as f:
+    if os.path.exists(pidfile) and os.path.exists(dconf.OLTPBENCH_LOG):
+        with open(dconf.OLTPBENCH_LOG, 'r') as f:
             content = f.read()
         ready = 'Output throughput samples into file' in content
     return ready
 
 
 def clean_logs():
-    # remove oltpbench log
-    cmd = 'rm -f {}'.format(CONF['oltpbench_log'])
-    local(cmd)
-
-    # remove controller log
-    cmd = 'rm -f {}'.format(CONF['controller_log'])
-    local(cmd)
+    # remove oltpbench and controller log files
+    local('rm -f {} {}'.format(dconf.OLTPBENCH_LOG, dconf.CONTROLLER_LOG))
 
 
 @task
-def lhs_samples(count=10):
-    cmd = 'python3 lhs.py {} {} {}'.format(count, CONF['lhs_knob_path'], CONF['lhs_save_path'])
-    local(cmd)
-
-
-@task
-def loop():
+def loop(i):
+    i = int(i)
 
     # free cache
     free_cache()
@@ -491,10 +519,11 @@ def loop():
 
     # restart database
     restart_database()
+    time.sleep(dconf.RESTART_SLEEP_SEC)
 
     # check disk usage
-    if check_disk_usage() > MAX_DISK_USAGE:
-        LOG.warning('Exceeds max disk usage %s', MAX_DISK_USAGE)
+    if check_disk_usage() > dconf.MAX_DISK_USAGE:
+        LOG.warning('Exceeds max disk usage %s', dconf.MAX_DISK_USAGE)
 
     # run controller from another process
     p = Process(target=run_controller, args=())
@@ -516,6 +545,7 @@ def loop():
     # stop the experiment
     while not _ready_to_shut_down_controller():
         time.sleep(1)
+
     signal_controller()
     LOG.info('Start the second collection, shut down the controller')
 
@@ -527,99 +557,18 @@ def loop():
     # save result
     result_timestamp = save_dbms_result()
 
-    # upload result
-    upload_result()
-
-    # get result
-    response = get_result()
-
-    # save next config
-    save_next_config(response, t=result_timestamp)
-
-    # change config
-    change_conf(response['recommendation'])
-
-
-@task
-def run_lhs():
-    datadir = CONF['lhs_save_path']
-    samples = glob.glob(os.path.join(datadir, 'config_*'))
-
-    # dump database if it's not done before.
-    dump = dump_database()
-
-    result_timestamp = None
-    for i, sample in enumerate(samples):
-        # reload database periodically
-        if RELOAD_INTERVAL > 0:
-            if i % RELOAD_INTERVAL == 0:
-                if i == 0 and dump is False:
-                    restore_database()
-                elif i > 0:
-                    restore_database()
-        # free cache
-        free_cache()
-
-        LOG.info('\n\n Start %s-th sample %s \n\n', i, sample)
-        # check memory usage
-        # check_memory_usage()
-
-        # check disk usage
-        if check_disk_usage() > MAX_DISK_USAGE:
-            LOG.warning('Exceeds max disk usage %s', MAX_DISK_USAGE)
-
-        # load the next lhs-sampled config
-        with open(sample, 'r') as f:
-            next_config = json.load(f, object_pairs_hook=OrderedDict)
-        save_next_config(next_config, t=result_timestamp)
-
-        # remove oltpbench log and controller log
-        clean_logs()
-
-        # change config
-        change_conf(next_config)
-
-        # restart database
-        restart_database()
-
-        if CONF.get('oracle_awr_enabled', False):
-            # create snapshot for oracle AWR report
-            if CONF['database_type'] == 'oracle':
-                local('sh snapshotOracle.sh')
-
-        # run controller from another process
-        p = Process(target=run_controller, args=())
-        p.start()
-
-        # run oltpbench as a background job
-        while not _ready_to_start_oltpbench():
-            pass
-        run_oltpbench_bg()
-        LOG.info('Run OLTP-Bench')
-
-        while not _ready_to_start_controller():
-            pass
-        signal_controller()
-        LOG.info('Start the first collection')
-
-        while not _ready_to_shut_down_controller():
-            pass
-        # stop the experiment
-        signal_controller()
-        LOG.info('Start the second collection, shut down the controller')
-
-        p.join()
-
-        # save result
-        result_timestamp = save_dbms_result()
-
+    if i >= dconf.WARMUP_ITERATIONS:
         # upload result
         upload_result()
 
-        if CONF.get('oracle_awr_enabled', False):
-            # create oracle AWR report for performance analysis
-            if CONF['database_type'] == 'oracle':
-                local('sh oracleScripts/snapshotOracle.sh && sh oracleScripts/awrOracle.sh')
+        # get result
+        response = get_result()
+
+        # save next config
+        save_next_config(response, t=result_timestamp)
+
+        # change config
+        change_conf(response['recommendation'])
 
 
 @task
@@ -628,13 +577,162 @@ def run_loops(max_iter=1):
     dump = dump_database()
 
     for i in range(int(max_iter)):
-        if RELOAD_INTERVAL > 0:
-            if i % RELOAD_INTERVAL == 0:
+        if dconf.RELOAD_INTERVAL > 0:
+            if i % dconf.RELOAD_INTERVAL == 0:
                 if i == 0 and dump is False:
+                    restart_database()
                     restore_database()
                 elif i > 0:
                     restore_database()
 
         LOG.info('The %s-th Loop Starts / Total Loops %s', i + 1, max_iter)
-        loop()
+        loop(i % dconf.RELOAD_INTERVAL if dconf.RELOAD_INTERVAL > 0 else i)
         LOG.info('The %s-th Loop Ends / Total Loops %s', i + 1, max_iter)
+
+
+@task
+def rename_batch(result_dir=None):
+    result_dir = result_dir or dconf.RESULT_DIR
+    results = glob.glob(os.path.join(result_dir, '*__summary.json'))
+    results = sorted(results)
+    for i, result in enumerate(results):
+        prefix = os.path.basename(result)
+        prefix_len = os.path.basename(result).find('_') + 2
+        prefix = prefix[:prefix_len]
+        new_prefix = str(i) + '__'
+        for base in ('summary', 'knobs', 'metrics_before', 'metrics_after'):
+            fpath = os.path.join(result_dir, prefix + base + '.json')
+            rename_path = os.path.join(result_dir, new_prefix + base + '.json')
+            os.rename(fpath, rename_path)
+
+
+def _http_content_to_json(content):
+    if isinstance(content, bytes):
+        content = content.decode('utf-8')
+    try:
+        json_content = json.loads(content)
+        decoded = True
+    except (TypeError, json.decoder.JSONDecodeError):
+        json_content = None
+        decoded = False
+
+    return json_content, decoded
+
+
+def _modify_website_object(obj_name, action, verbose=False, **kwargs):
+    verbose = _parse_bool(verbose)
+    if obj_name == 'project':
+        valid_actions = ('create', 'edit')
+    elif obj_name == 'session':
+        valid_actions = ('create', 'edit')
+    elif obj_name == 'user':
+        valid_actions = ('create', 'delete')
+    else:
+        raise ValueError('Invalid object: {}. Valid objects: project, session'.format(obj_name))
+
+    if action not in valid_actions:
+        raise ValueError('Invalid action: {}. Valid actions: {}'.format(
+            action, ', '.join(valid_actions)))
+
+    data = {}
+    for k, v in kwargs.items():
+        if isinstance(v, (dict, list, tuple)):
+            v = json.dumps(v)
+        data[k] = v
+
+    url_path = '/{}/{}/'.format(action, obj_name)
+    response = requests.post(CONF['upload_url'] + url_path, data=data)
+
+    content = response.content.decode('utf-8')
+    if response.status_code != 200:
+        raise Exception("Failed to {} new {}.\nStatus: {}\nMessage: {}\n".format(
+            action, obj_name, response.status_code, content))
+
+    json_content, decoded = _http_content_to_json(content)
+    if verbose:
+        if decoded:
+            LOG.info('\n%s_%s = %s', action.upper(), obj_name.upper(),
+                     json.dumps(json_content, indent=4))
+        else:
+            LOG.warning("Content could not be decoded.\n\n%s\n", content)
+
+    return response, json_content, decoded
+
+
+@task
+def create_website_user(**kwargs):
+    return _modify_website_object('user', 'create', **kwargs)
+
+
+@task
+def delete_website_user(**kwargs):
+    return _modify_website_object('user', 'delete', **kwargs)
+
+
+@task
+def create_website_project(**kwargs):
+    return _modify_website_object('project', 'create', **kwargs)
+
+
+@task
+def edit_website_project(**kwargs):
+    return _modify_website_object('project', 'edit', **kwargs)
+
+
+@task
+def create_website_session(**kwargs):
+    return _modify_website_object('session', 'create', **kwargs)
+
+
+@task
+def edit_website_session(**kwargs):
+    return _modify_website_object('session', 'edit', **kwargs)
+
+
+def wait_pipeline_data_ready(max_time_sec=800, interval_sec=10):
+    max_time_sec = int(max_time_sec)
+    interval_sec = int(interval_sec)
+    elapsed = 0
+    ready = False
+
+    while elapsed <= max_time_sec:
+        response = requests.get(dconf.WEBSITE_URL + '/test/pipeline/')
+        content = get_content(response)
+        LOG.info("%s (elapsed: %ss)", content, elapsed)
+        if 'False' in content:
+            time.sleep(interval_sec)
+            elapsed += interval_sec
+        else:
+            ready = True
+            break
+
+    return ready
+
+
+@task
+def integration_tests():
+
+    # Create test website
+    response = requests.get(dconf.WEBSITE_URL + '/test/create/')
+    LOG.info(get_content(response))
+
+    # Upload training data
+    LOG.info('Upload training data to no tuning session')
+    upload_batch(result_dir='../../integrationTests/data/', upload_code='ottertuneTestNoTuning')
+
+    # wait celery periodic task finishes
+    assert wait_pipeline_data_ready(), "Pipeline data failed"
+
+    # Test DNN
+    LOG.info('Test DNN (deep neural network)')
+    upload_result(result_dir='../../integrationTests/data/', prefix='0__',
+                  upload_code='ottertuneTestTuningDNN')
+    response = get_result(upload_code='ottertuneTestTuningDNN')
+    assert response['status'] == 'good'
+
+    # Test GPR
+    LOG.info('Test GPR (gaussian process regression)')
+    upload_result(result_dir='../../integrationTests/data/', prefix='0__',
+                  upload_code='ottertuneTestTuningGPR')
+    response = get_result(upload_code='ottertuneTestTuningGPR')
+    assert response['status'] == 'good'

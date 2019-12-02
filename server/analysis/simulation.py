@@ -14,13 +14,19 @@ try:
 except (ModuleNotFoundError, ImportError):
     plt = None
 import numpy as np
+import tensorflow as tf
+import gpflow
 import torch
 sys.path.append("../")
-from analysis.util import get_analysis_logger  # noqa
+from analysis.util import get_analysis_logger, TimerStruct  # noqa
 from analysis.ddpg.ddpg import DDPG  # noqa
 from analysis.ddpg.ou_process import OUProcess  # noqa
 from analysis.gp_tf import GPRGD  # noqa
 from analysis.nn_tf import NeuralNet  # noqa
+from analysis.gpr import gpr_models  # noqa
+from analysis.gpr import ucb  # noqa
+from analysis.gpr.optimize import tf_optimize  # noqa
+
 
 LOG = get_analysis_logger(__name__)
 
@@ -98,25 +104,33 @@ class Environment(object):
 def ddpg(env, config, n_loops=100):
     results = []
     x_axis = []
+    num_collections = config['num_collections']
     gamma = config['gamma']
-    tau = config['tau']
     a_lr = config['a_lr']
     c_lr = config['c_lr']
     n_epochs = config['n_epochs']
-    model_ddpg = DDPG(n_actions=env.knob_dim, n_states=env.metric_dim, gamma=gamma, tau=tau,
-                      clr=c_lr, alr=a_lr)
+    ahs = config['a_hidden_sizes']
+    chs = config['c_hidden_sizes']
+    model_ddpg = DDPG(n_actions=env.knob_dim, n_states=env.metric_dim, gamma=gamma,
+                      clr=c_lr, alr=a_lr, shift=0, a_hidden_sizes=ahs, c_hidden_sizes=chs)
     knob_data = np.random.rand(env.knob_dim)
     prev_metric_data = np.zeros(env.metric_dim)
 
-    for i in range(n_loops):
-        reward, metric_data = env.simulate(knob_data)
+    for i in range(num_collections):
+        action = np.random.rand(env.knob_dim)
+        reward, metric_data = env.simulate(action)
         if i > 0:
             model_ddpg.add_sample(prev_metric_data, prev_knob_data, prev_reward, metric_data)
         prev_metric_data = metric_data
         prev_knob_data = knob_data
         prev_reward = reward
-        if i == 0:
-            continue
+
+    for i in range(n_loops):
+        reward, metric_data = env.simulate(knob_data)
+        model_ddpg.add_sample(prev_metric_data, prev_knob_data, prev_reward, prev_metric_data)
+        prev_metric_data = metric_data
+        prev_knob_data = knob_data
+        prev_reward = reward
         for _ in range(n_epochs):
             model_ddpg.update()
         results.append(reward)
@@ -144,11 +158,18 @@ def dnn(env, config, n_loops=100):
     results = []
     x_axis = []
     memory = ReplayMemory()
+    num_collections = config['num_collections']
     num_samples = config['num_samples']
-    ou_process = config['ou_process']
+    ou_process = False
     Xmin = np.zeros(env.knob_dim)
     Xmax = np.ones(env.knob_dim)
     noise = OUProcess(env.knob_dim)
+
+    for _ in range(num_collections):
+        action = np.random.rand(env.knob_dim)
+        reward, _ = env.simulate(action)
+        memory.push(action, reward)
+
     for i in range(n_loops):
         X_samples = np.random.rand(num_samples, env.knob_dim)
         if i >= 10:
@@ -157,18 +178,20 @@ def dnn(env, config, n_loops=100):
             top10 = heapq.nlargest(10, tuples, key=lambda e: e[1])
             for entry in top10:
                 X_samples = np.vstack((X_samples, np.array(entry[0])))
+        tf.reset_default_graph()
+        tf.InteractiveSession()
         model_nn = NeuralNet(n_input=X_samples.shape[1],
                              batch_size=X_samples.shape[0],
-                             learning_rate=0.01,
+                             learning_rate=0.005,
                              explore_iters=100,
                              noise_scale_begin=0.1,
                              noise_scale_end=0.0,
                              debug=False,
                              debug_interval=100)
-        if i >= 5:
-            actions, rewards = memory.get_all()
-            model_nn.fit(np.array(actions), -np.array(rewards), fit_epochs=50)
-        res = model_nn.recommend(X_samples, Xmin, Xmax, recommend_epochs=10, explore=False)
+        actions, rewards = memory.get_all()
+        model_nn.fit(np.array(actions), -np.array(rewards), fit_epochs=100)
+        res = model_nn.recommend(X_samples, Xmin, Xmax, recommend_epochs=20, explore=False)
+
         best_config_idx = np.argmin(res.minl.ravel())
         best_config = res.minl_conf[best_config_idx, :]
         if ou_process:
@@ -182,7 +205,7 @@ def dnn(env, config, n_loops=100):
     return np.array(results), np.array(x_axis)
 
 
-def gprgd(env, config, n_loops=100):
+def gpr(env, config, n_loops=100):
     results = []
     x_axis = []
     memory = ReplayMemory()
@@ -194,6 +217,7 @@ def gprgd(env, config, n_loops=100):
         action = np.random.rand(env.knob_dim)
         reward, _ = env.simulate(action)
         memory.push(action, reward)
+
     for i in range(n_loops):
         X_samples = np.random.rand(num_samples, env.knob_dim)
         if i >= 10:
@@ -206,13 +230,13 @@ def gprgd(env, config, n_loops=100):
                 X_samples = np.vstack((X_samples, np.array(entry[0]) * 0.97 + 0.01))
         model = GPRGD(length_scale=1.0,
                       magnitude=1.0,
-                      max_train_size=100,
+                      max_train_size=2000,
                       batch_size=100,
                       num_threads=4,
                       learning_rate=0.01,
                       epsilon=1e-6,
                       max_iter=500,
-                      sigma_multiplier=30.0,
+                      sigma_multiplier=3.0,
                       mu_multiplier=1.0)
 
         actions, rewards = memory.get_all()
@@ -224,7 +248,98 @@ def gprgd(env, config, n_loops=100):
         memory.push(best_config, reward)
         LOG.info('loop: %d reward: %f', i, reward[0])
         results.append(reward)
-        x_axis.append(i)
+        x_axis.append(i+1)
+    return np.array(results), np.array(x_axis)
+
+
+def run_optimize(X, y, X_samples, model_name, opt_kwargs, model_kwargs):
+    timer = TimerStruct()
+
+    # Create model (this also optimizes the hyperparameters if that option is enabled
+    timer.start()
+    tf.reset_default_graph()
+    graph = tf.get_default_graph()
+    gpflow.reset_default_session(graph=graph)
+    m = gpr_models.create_model(model_name, X=X, y=y, **model_kwargs)
+    timer.stop()
+    model_creation_sec = timer.elapsed_seconds
+    LOG.info(m.model.as_pandas_table())
+
+    # Optimize the DBMS's configuration knobs
+    timer.start()
+    res = tf_optimize(m.model, X_samples, **opt_kwargs)
+    timer.stop()
+    config_optimize_sec = timer.elapsed_seconds
+
+    return res.minl_conf, res.minl, m.get_model_parameters(), m.get_hyperparameters()
+
+
+def gpr_new(env, config, n_loops=100):
+    model_name = 'BasicGP'
+    model_opt_frequency = 0
+    model_kwargs = {}
+    model_kwargs['model_learning_rate'] = 0.001
+    model_kwargs['model_maxiter'] = 5000
+    opt_kwargs = {}
+    opt_kwargs['learning_rate'] = 0.01
+    opt_kwargs['maxiter'] = 500
+
+    results = []
+    x_axis = []
+    memory = ReplayMemory()
+    num_samples = config['num_samples']
+    num_collections = config['num_collections']
+    X_min = np.zeros(env.knob_dim)
+    X_max = np.ones(env.knob_dim)
+    X_bounds = [X_min, X_max]
+    opt_kwargs['bounds'] = X_bounds
+
+    for _ in range(num_collections):
+        action = np.random.rand(env.knob_dim)
+        reward, _ = env.simulate(action)
+        memory.push(action, reward)
+
+    for i in range(n_loops):
+        X_samples = np.random.rand(num_samples, env.knob_dim)
+        if i >= 5:
+            actions, rewards = memory.get_all()
+            tuples = tuple(zip(actions, rewards))
+            top10 = heapq.nlargest(10, tuples, key=lambda e: e[1])
+            for entry in top10:
+                # Tensorflow get broken if we use the training data points as
+                # starting points for GPRGD.
+                X_samples = np.vstack((X_samples, np.array(entry[0]) * 0.97 + 0.01))
+
+        actions, rewards = memory.get_all()
+
+        ucb_beta = config['beta']
+        opt_kwargs['ucb_beta'] = ucb.get_ucb_beta(ucb_beta, scale=config['scale'],
+                                                  t=i + 1., ndim=env.knob_dim)
+        if model_opt_frequency > 0:
+            optimize_hyperparams = i % model_opt_frequency == 0
+            if not optimize_hyperparams:
+                model_kwargs['hyperparameters'] = hyperparameters
+        else:
+            optimize_hyperparams = False
+            model_kwargs['hyperparameters'] = None
+        model_kwargs['optimize_hyperparameters'] = optimize_hyperparams
+        X_new, ypred, _, hyperparameters = run_optimize(np.array(actions),
+                                                        -np.array(rewards),
+                                                        X_samples,
+                                                        model_name,
+                                                        opt_kwargs,
+                                                        model_kwargs)
+
+        sort_index = np.argsort(ypred.squeeze())
+        X_new = X_new[sort_index]
+        ypred = ypred[sort_index].squeeze()
+        action = X_new[0]
+        reward, _ = env.simulate(action)
+        memory.push(action, reward)
+        LOG.info('loop: %d reward: %f', i, reward[0])
+        results.append(reward)
+        x_axis.append(i+1)
+
     return np.array(results), np.array(x_axis)
 
 
@@ -233,11 +348,11 @@ def plotlines(xs, results, labels, title, path):
         figsize = 13, 10
         figure, ax = plt.subplots(figsize=figsize)
         lines = []
-        N = 20
+        N = 1
         weights = np.ones(N)
         for x_axis, result, label in zip(xs, results, labels):
-            result = np.convolve(weights/weights.sum(), result.flatten())[N-1:-N+1]
-            lines.append(plt.plot(x_axis[:-N+1], result, label=label, lw=4)[0])
+            result = np.convolve(weights/weights.sum(), result.flatten())[N-1:-N]
+            lines.append(plt.plot(x_axis[:-N], result, label=label, lw=4)[0])
         plt.legend(handles=lines, fontsize=30)
         plt.title(title, fontsize=25)
         plt.xticks(fontsize=25)
@@ -251,7 +366,7 @@ def plotlines(xs, results, labels, title, path):
 def run(tuners, configs, labels, title, env, n_loops, n_repeats):
     if not plt:
         LOG.info("Cannot import matplotlib. Will write results to files instead of figures.")
-    random.seed(0)
+    random.seed(1)
     np.random.seed(1)
     torch.manual_seed(0)
     results = []
@@ -279,17 +394,19 @@ def run(tuners, configs, labels, title, env, n_loops, n_repeats):
 
 
 def main():
-    env = Environment(knob_dim=192, metric_dim=60, modes=[0, 1], reward_variance=0.05)
-    n_loops = 2000
-    configs = [{'gamma': 0, 'tau': 0.002, 'a_lr': 0.01, 'c_lr': 0.01, 'n_epochs': 1},
-               {'gamma': 0, 'tau': 0.002, 'a_lr': 0.01, 'c_lr': 0.001, 'n_epochs': 1},
-               {'gamma': 0., 'tau': 0.002, 'a_lr': 0.001, 'c_lr': 0.001, 'n_epochs': 1},
-               # {'num_samples': 100, 'ou_process': False},
-               ]
-    tuners = [ddpg, ddpg, ddpg]
-    labels = ['1', '2', '3']
-    title = 'varing_workloads'
-    n_repeats = [3, 3, 3]
+    env = Environment(knob_dim=192, metric_dim=60, modes=[2], reward_variance=0.15)
+    title = 'dim=192'
+    n_repeats = [1, 1, 1, 1, 1, 1]
+    n_loops = 200
+    configs = [{'num_collections': 5, 'num_samples': 30, 'beta': 'get_beta_td', 'scale': 0.1},
+               {'num_collections': 5, 'num_samples': 30, 'beta': 'get_beta_td', 'scale': 0.2},
+               {'num_collections': 5, 'num_samples': 30, 'beta': 'get_beta_td', 'scale': 0.6},
+               {'num_collections': 5, 'num_samples': 30},
+               {'gamma': 0., 'c_lr': 0.001, 'a_lr': 0.02, 'num_collections': 1, 'n_epochs': 30,
+                'a_hidden_sizes': [128, 128, 64], 'c_hidden_sizes': [64, 128, 64]},
+               {'num_collections': 5, 'num_samples': 30}]
+    tuners = [gpr_new, gpr_new, gpr_new, gpr, ddpg, dnn]
+    labels = ['gpr_new_0.5', 'gpr_new_1', 'gpr_new_3', 'gpr', 'ddpg', 'dnn']
     run(tuners, configs, labels, title, env, n_loops, n_repeats)
 
 
