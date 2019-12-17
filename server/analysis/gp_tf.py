@@ -36,18 +36,21 @@ class GPRGDResult(GPRResult):
 
 class GPR(object):
 
-    def __init__(self, length_scale=1.0, magnitude=1.0, max_train_size=7000,
-                 batch_size=3000, num_threads=4, check_numerics=True, debug=False):
+    def __init__(self, length_scale=2.0, magnitude=1.0, ridge=1.0, max_train_size=7000,
+                 batch_size=3000, num_threads=4, check_numerics=True, debug=False,
+                 hyperparameter_trainable=False):
         assert np.isscalar(length_scale)
         assert np.isscalar(magnitude)
         assert length_scale > 0 and magnitude > 0
         self.length_scale = length_scale
         self.magnitude = magnitude
+        self.ridge = ridge
         self.max_train_size_ = max_train_size
         self.batch_size_ = batch_size
         self.num_threads_ = num_threads
         self.check_numerics = check_numerics
         self.debug = debug
+        self.hyperparameter_trainable = hyperparameter_trainable
         self.X_train = None
         self.y_train = None
         self.xy_ = None
@@ -57,18 +60,45 @@ class GPR(object):
         self.vars = None
         self.ops = None
 
+
     def build_graph(self):
         self.vars = {}
         self.ops = {}
         self.graph = tf.Graph()
         with self.graph.as_default():
-            mag_const = tf.constant(self.magnitude,
-                                    dtype=np.float32,
-                                    name='magnitude')
-            ls_const = tf.constant(self.length_scale,
-                                   dtype=np.float32,
-                                   name='length_scale')
+            if self.hyperparameter_trainable:
+                r"""
+                A transform of the form
+                .. math::
 
+                y = \log(1 + \exp(x))
+
+                x is a free variable, y is always positive.
+                This function is known as 'softplus' in tensorflow.
+                This transformation gaurantees y value is always positive
+                """
+                mag_ = np.log(np.exp(self.magnitude) - 1)
+                ls_ = np.log(np.exp(self.length_scale) - 1)
+                noise_ = np.log(np.exp(self.ridge) - 1)
+                mag_var = tf.nn.softplus(tf.Variable(mag_,
+                                                     dtype=np.float32,
+                                                     name='magnitude'))
+                ls_var = tf.nn.softplus(tf.Variable(ls_,
+                                                    dtype=np.float32,
+                                                    name='length_scale'))
+                noise_var = tf.nn.softplus(tf.Variable(noise_,
+                                                       dtype=np.float32,
+                                                       name='noise_scale'))
+            else:
+                mag_var = tf.constant(self.magnitude,
+                                      dtype=np.float32,
+                                      name='magnitude')
+                ls_var = tf.constant(self.length_scale,
+                                     dtype=np.float32,
+                                     name='length_scale')
+                noise_var = tf.constant(self.ridge,
+                                        dtype=np.float32,
+                                        name='noise_scale')
             # Nodes for distance computation
             v1 = tf.placeholder(tf.float32, name="v1")
             v2 = tf.placeholder(tf.float32, name="v2")
@@ -79,11 +109,14 @@ class GPR(object):
             self.vars['v1_h'] = v1
             self.vars['v2_h'] = v2
             self.ops['dist_op'] = dist_op
+            self.vars['mag_v'] = mag_var
+            self.vars['ls_v'] = ls_var
+            self.vars['noise_v'] = noise_var
 
             # Nodes for kernel computation
             X_dists = tf.placeholder(tf.float32, name='X_dists')
             ridge_ph = tf.placeholder(tf.float32, name='ridge')
-            K_op = mag_const * tf.exp(-X_dists / ls_const)
+            K_op = mag_var * tf.exp(-X_dists / ls_var)  # pylint: disable=invalid-name
             if self.check_numerics:
                 K_op = tf.check_numerics(K_op, "K_op: ")
             K_ridge_op = K_op + tf.diag(ridge_ph)
@@ -117,13 +150,15 @@ class GPR(object):
             # Nodes for yhat/sigma computation
             K2 = tf.placeholder(tf.float32, name="K2")
             K3 = tf.placeholder(tf.float32, name="K3")
+            ridge_test_ph = tf.placeholder(tf.float32, name="ridge_test_ph")
             yhat_ = tf.cast(tf.matmul(tf.transpose(K2), xy_), tf.float32)
             if self.check_numerics:
                 yhat_ = tf.check_numerics(yhat_, "yhat_: ")
             sv1 = tf.matmul(tf.transpose(K2), tf.matmul(K_inv, K2))
             if self.check_numerics:
                 sv1 = tf.check_numerics(sv1, "sv1: ")
-            sig_val = tf.cast((tf.sqrt(tf.diag_part(K3 - sv1))), tf.float32)
+            sig_val = tf.cast((tf.sqrt(tf.diag_part(K3 + tf.diag(ridge_test_ph) - sv1))),
+                              tf.float32)
             if self.check_numerics:
                 sig_val = tf.check_numerics(sig_val, "sig_val: ")
 
@@ -131,6 +166,7 @@ class GPR(object):
             self.vars['K3_h'] = K3
             self.ops['yhat_op'] = yhat_
             self.ops['sig_op'] = sig_val
+            self.ops['ridge_test_h'] = ridge_test_ph
 
             # Compute y_best (min y)
             y_best_op = tf.cast(tf.reduce_min(yt_, 0, True), tf.float32)
@@ -180,22 +216,27 @@ class GPR(object):
             raise Exception("Input contains non-finite values: {}"
                             .format(X[~finite_els]))
 
-    def fit(self, X_train, y_train, ridge=1.0):
+    def fit(self, X_train, y_train):
         self._reset()
         X_train, y_train = self.check_X_y(X_train, y_train)
         self.X_train = np.float32(X_train)
         self.y_train = np.float32(y_train)
         sample_size = self.X_train.shape[0]
-
-        if np.isscalar(ridge):
-            ridge = np.ones(sample_size) * ridge
-        assert isinstance(ridge, np.ndarray)
-        assert ridge.ndim == 1
+        ridge = self.ridge
 
         X_dists = np.zeros((sample_size, sample_size), dtype=np.float32)
         with tf.Session(graph=self.graph,
                         config=tf.ConfigProto(
                             intra_op_parallelism_threads=self.num_threads_)) as sess:
+            init = tf.global_variables_initializer()
+            sess.run(init)
+
+            noise_var = self.vars['noise_v']
+            if np.isscalar(ridge):
+                ridge = np.ones(sample_size) * sess.run(noise_var)
+            assert isinstance(ridge, np.ndarray)
+            assert ridge.ndim == 1
+
             dist_op = self.ops['dist_op']
             v1, v2 = self.vars['v1_h'], self.vars['v2_h']
             for i in range(sample_size):
@@ -224,13 +265,19 @@ class GPR(object):
         X_test = np.float32(GPR.check_array(X_test))
         test_size = X_test.shape[0]
         sample_size = self.X_train.shape[0]
-
+        ridge = self.ridge
         arr_offset = 0
         yhats = np.zeros([test_size, 1])
         sigmas = np.zeros([test_size, 1])
         with tf.Session(graph=self.graph,
                         config=tf.ConfigProto(
                             intra_op_parallelism_threads=self.num_threads_)) as sess:
+            init = tf.global_variables_initializer()
+            sess.run(init)
+
+            noise_var = self.vars['noise_v']
+            if np.isscalar(ridge):
+                ridge_test = np.ones(test_size) * sess.run(noise_var)
             # Nodes for distance operation
             dist_op = self.ops['dist_op']
             v1 = self.vars['v1_h']
@@ -246,7 +293,7 @@ class GPR(object):
             K2 = self.vars['K2_h']
             K3 = self.vars['K3_h']
             xy_ph = self.vars['xy_h']
-
+            ridge_test_ph = self.ops['ridge_test_h']
             while arr_offset < test_size:
                 if arr_offset + self.batch_size_ > test_size:
                     end_offset = test_size
@@ -270,7 +317,8 @@ class GPR(object):
                 K3_ = sess.run(K_op, feed_dict={X_dists: dists2})
 
                 sigma = np.zeros([1, batch_len], np.float32)
-                sigma[0] = sess.run(sig_val, feed_dict={K_inv_ph: self.K_inv, K2: K2_, K3: K3_})
+                sigma[0] = sess.run(sig_val, feed_dict={K_inv_ph: self.K_inv, K2: K2_,
+                                                        K3: K3_, ridge_test_ph: ridge_test})
                 sigma = np.transpose(sigma)
                 yhats[arr_offset: end_offset] = yhat
                 sigmas[arr_offset: end_offset] = sigma
@@ -310,8 +358,9 @@ class GPRGD(GPR):
     GP_BETA_CONST = "CONST"
 
     def __init__(self,
-                 length_scale=1.0,
+                 length_scale=2.0,
                  magnitude=1.0,
+                 ridge=1.0,
                  max_train_size=7000,
                  batch_size=3000,
                  num_threads=4,
@@ -319,12 +368,19 @@ class GPRGD(GPR):
                  epsilon=1e-6,
                  max_iter=100,
                  sigma_multiplier=3.0,
-                 mu_multiplier=1.0):
+                 mu_multiplier=1.0,
+                 check_numerics=True,
+                 debug=False,
+                 hyperparameter_trainable=False):
         super(GPRGD, self).__init__(length_scale=length_scale,
                                     magnitude=magnitude,
+                                    ridge=ridge,
                                     max_train_size=max_train_size,
                                     batch_size=batch_size,
-                                    num_threads=num_threads)
+                                    num_threads=num_threads,
+                                    check_numerics=check_numerics,
+                                    debug=debug,
+                                    hyperparameter_trainable=hyperparameter_trainable)
         self.learning_rate = learning_rate
         self.epsilon = epsilon
         self.max_iter = max_iter
@@ -333,8 +389,8 @@ class GPRGD(GPR):
         self.X_min = None
         self.X_max = None
 
-    def fit(self, X_train, y_train, X_min, X_max, ridge):  # pylint: disable=arguments-differ
-        super(GPRGD, self).fit(X_train, y_train, ridge)
+    def fit(self, X_train, y_train, X_min, X_max):  # pylint: disable=arguments-differ
+        super(GPRGD, self).fit(X_train, y_train)
         self.X_min = X_min
         self.X_max = X_max
 
@@ -346,17 +402,21 @@ class GPRGD(GPR):
             xt_assign_op = xt_.assign(xt_ph)
             init = tf.global_variables_initializer()
             sess.run(init)
+
+            mag_var = self.vars['mag_v']
+            ls_var = self.vars['ls_v']
+            noise_var = self.vars['noise_v']
             K2_mat = tf.transpose(tf.expand_dims(tf.sqrt(tf.reduce_sum(tf.pow(
                 tf.subtract(xt_, self.X_train), 2), 1)), 0))
             if self.check_numerics is True:
                 K2_mat = tf.check_numerics(K2_mat, "K2_mat: ")
-            K2__ = tf.cast(self.magnitude * tf.exp(-K2_mat / self.length_scale), tf.float32)
+            K2__ = tf.cast(mag_var * tf.exp(-K2_mat / ls_var), tf.float32)  # pylint: disable=invalid-name
             if self.check_numerics is True:
                 K2__ = tf.check_numerics(K2__, "K2__: ")
             yhat_gd = tf.cast(tf.matmul(tf.transpose(K2__), self.xy_), tf.float32)
             if self.check_numerics is True:
                 yhat_gd = tf.check_numerics(yhat_gd, message="yhat: ")
-            sig_val = tf.cast((tf.sqrt(self.magnitude - tf.matmul(
+            sig_val = tf.cast((tf.sqrt(mag_var + noise_var - tf.matmul(
                 tf.transpose(K2__), tf.matmul(self.K_inv, K2__)))), tf.float32)
             if self.check_numerics is True:
                 sig_val = tf.check_numerics(sig_val, message="sigma: ")
@@ -430,7 +490,7 @@ class GPRGD(GPR):
                     sigmas_it = np.empty((self.max_iter + 1,)) * np.nan
                     losses_it = np.empty((self.max_iter + 1,)) * np.nan
                     confs_it = np.empty((self.max_iter + 1, nfeats)) * np.nan
-
+                    sess.run(init)
                     sess.run(assign_op, feed_dict={xt_ph: X_test_batch[i]})
                     step = 0
                     for step in range(self.max_iter):

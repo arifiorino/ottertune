@@ -25,7 +25,8 @@ from analysis.gpr import ucb
 from analysis.gpr.optimize import tf_optimize
 from analysis.preprocessing import Bin, DummyEncoder
 from analysis.constraints import ParamConstraintHelper
-from website.models import PipelineData, PipelineRun, Result, Workload, KnobCatalog, SessionKnob
+from website.models import (PipelineData, PipelineRun, Result, Workload, KnobCatalog, SessionKnob,
+                            MetricCatalog)
 from website import db
 from website.types import PipelineTaskType, AlgorithmType
 from website.utils import DataUtil, JSONUtil
@@ -36,12 +37,14 @@ from website.settings import (USE_GPFLOW, DEFAULT_LENGTH_SCALE, DEFAULT_MAGNITUD
                               DEFAULT_EPSILON, MAX_ITER, GPR_EPS,
                               DEFAULT_SIGMA_MULTIPLIER, DEFAULT_MU_MULTIPLIER,
                               DEFAULT_UCB_SCALE, HP_LEARNING_RATE, HP_MAX_ITER,
+                              DDPG_SIMPLE_REWARD, DDPG_GAMMA, USE_DEFAULT,
                               DDPG_BATCH_SIZE, ACTOR_LEARNING_RATE,
                               CRITIC_LEARNING_RATE, UPDATE_EPOCHS,
                               ACTOR_HIDDEN_SIZES, CRITIC_HIDDEN_SIZES,
                               DNN_TRAIN_ITER, DNN_EXPLORE, DNN_EXPLORE_ITER,
                               DNN_NOISE_SCALE_BEGIN, DNN_NOISE_SCALE_END,
-                              DNN_DEBUG, DNN_DEBUG_INTERVAL)
+                              DNN_DEBUG, DNN_DEBUG_INTERVAL, GPR_DEBUG, UCB_BETA,
+                              GPR_MODEL_NAME, ENABLE_DUMMY_ENCODER)
 
 from website.settings import INIT_FLIP_PROB, FLIP_PROB_DECAY
 from website.types import VarType
@@ -111,14 +114,12 @@ class ConfigurationRecommendation(UpdateTask):  # pylint: disable=abstract-metho
 
         # Replace result with formatted result
         formatted_params = db.parser.format_dbms_knobs(result.dbms.pk, retval['recommendation'])
+        # Create next configuration to try
+        config = db.parser.create_knob_configuration(result.dbms.pk, formatted_params)
         task_meta = TaskMeta.objects.get(task_id=task_id)
-        retval['recommendation'] = formatted_params
+        retval['recommendation'] = config
         task_meta.result = retval
         task_meta.save()
-
-        # Create next configuration to try
-        config = db.parser.create_knob_configuration(result.dbms.pk, retval['recommendation'])
-        retval['recommendation'] = config
         result.next_configuration = JSONUtil.dumps(retval)
         result.save()
 
@@ -137,7 +138,11 @@ def clean_knob_data(knob_matrix, knob_labels, session):
         for knob in missing_columns:
             knob_object = KnobCatalog.objects.get(dbms=session.dbms, name=knob, tunable=True)
             index = knob_cat.index(knob)
-            matrix = np.insert(matrix, index, knob_object.default, axis=1)
+            try:
+                default_val = float(knob_object.default)
+            except ValueError:
+                default_val = 0
+            matrix = np.insert(matrix, index, default_val, axis=1)
             knob_labels.insert(index, knob)
     # If they are useless columns in the matrix
     if unused_columns:
@@ -147,6 +152,35 @@ def clean_knob_data(knob_matrix, knob_labels, session):
         for i in sorted(indexes, reverse=True):
             del knob_labels[i]
     return matrix, knob_labels
+
+
+def clean_metric_data(metric_matrix, metric_labels, session):
+    # Makes sure that all knobs in the dbms are included in the knob_matrix and knob_labels
+    metric_objs = MetricCatalog.objects.filter(dbms=session.dbms)
+    metric_cat = [session.target_objective]
+    for metric_obj in metric_objs:
+        metric_cat.append(metric_obj.name)
+    matrix = np.array(metric_matrix)
+    missing_columns = sorted(set(metric_cat) - set(metric_labels))
+    unused_columns = set(metric_labels) - set(metric_cat)
+    LOG.debug("clean_metric_data added %d metrics and removed %d metric.", len(missing_columns),
+              len(unused_columns))
+    # If columns are missing from the matrix
+    if missing_columns:
+        for metric in missing_columns:
+            index = metric_cat.index(metric)
+            default_val = 0
+            matrix = np.insert(matrix, index, default_val, axis=1)
+            metric_labels.insert(index, metric)
+    LOG.debug(matrix.shape)
+    # If they are useless columns in the matrix
+    if unused_columns:
+        indexes = [i for i, n in enumerate(metric_labels) if n in unused_columns]
+        # Delete unused columns
+        matrix = np.delete(matrix, indexes, 1)
+        for i in sorted(indexes, reverse=True):
+            del metric_labels[i]
+    return matrix, metric_labels
 
 
 @task(base=AggregateTargetResults, name='aggregate_target_results')
@@ -209,8 +243,8 @@ def aggregate_target_results(result_id, algorithm):
         agg_data['X_matrix'] = np.array(cleaned_agg_data[0])
         agg_data['X_columnlabels'] = np.array(cleaned_agg_data[1])
 
-        LOG.debug('%s: Finished aggregating target results.\n\ndata=%s\n',
-                  AlgorithmType.name(algorithm), JSONUtil.dumps(agg_data, pprint=True))
+        LOG.debug('%s: Finished aggregating target results.\n\n',
+                  AlgorithmType.name(algorithm))
 
     return agg_data, algorithm
 
@@ -271,10 +305,15 @@ def gen_lhs_samples(knobs, nsamples):
         for fidx in range(nfeats):
             if types[fidx] == VarType.INTEGER:
                 lhs_samples[-1][names[fidx]] = int(round(samples[sidx][fidx]))
+            elif types[fidx] == VarType.BOOL:
+                lhs_samples[-1][names[fidx]] = int(round(samples[sidx][fidx]))
+            elif types[fidx] == VarType.ENUM:
+                lhs_samples[-1][names[fidx]] = int(round(samples[sidx][fidx]))
             elif types[fidx] == VarType.REAL:
                 lhs_samples[-1][names[fidx]] = float(samples[sidx][fidx])
             else:
                 LOG.debug("LHS type not supported: %s", types[fidx])
+    random.shuffle(lhs_samples)
 
     return lhs_samples
 
@@ -285,18 +324,33 @@ def train_ddpg(result_id):
     result = Result.objects.get(pk=result_id)
     session = Result.objects.get(pk=result_id).session
     session_results = Result.objects.filter(session=session,
-                                            creation_time__lte=result.creation_time)
+                                            creation_time__lt=result.creation_time)
     result_info = {}
     result_info['newest_result_id'] = result_id
 
-    # Extract data from result
+    # Extract data from result and previous results
     result = Result.objects.filter(pk=result_id)
-    base_result_id = session_results[0].pk
+    if len(session_results) == 0:
+        base_result_id = result_id
+        prev_result_id = result_id
+    else:
+        base_result_id = session_results[0].pk
+        prev_result_id = session_results[len(session_results)-1].pk
     base_result = Result.objects.filter(pk=base_result_id)
+    prev_result = Result.objects.filter(pk=prev_result_id)
 
     agg_data = DataUtil.aggregate_data(result)
-    metric_data = agg_data['y_matrix'].flatten()
     base_metric_data = (DataUtil.aggregate_data(base_result))['y_matrix'].flatten()
+    prev_metric_data = (DataUtil.aggregate_data(prev_result))['y_matrix'].flatten()
+
+    result = Result.objects.get(pk=result_id)
+    target_objective = result.session.target_objective
+    prev_obj_idx = [i for i, n in enumerate(agg_data['y_columnlabels']) if n == target_objective]
+
+    # Clean metric data
+    metric_data, metric_labels = clean_metric_data(agg_data['y_matrix'],
+                                                   agg_data['y_columnlabels'], session)
+    metric_data = metric_data.flatten()
     metric_scalar = MinMaxScaler().fit(metric_data.reshape(1, -1))
     normalized_metric_data = metric_scalar.transform(metric_data.reshape(1, -1))[0]
 
@@ -311,9 +365,7 @@ def train_ddpg(result_id):
     LOG.info('knob_num: %d, metric_num: %d', knob_num, metric_num)
 
     # Filter ys by current target objective metric
-    result = Result.objects.get(pk=result_id)
-    target_objective = result.session.target_objective
-    target_obj_idx = [i for i, n in enumerate(agg_data['y_columnlabels']) if n == target_objective]
+    target_obj_idx = [i for i, n in enumerate(metric_labels) if n == target_objective]
     if len(target_obj_idx) == 0:
         raise Exception(('Could not find target objective in metrics '
                          '(target_obj={})').format(target_objective))
@@ -322,22 +374,38 @@ def train_ddpg(result_id):
                          'metrics (target_obj={})').format(len(target_obj_idx),
                                                            target_objective))
     objective = metric_data[target_obj_idx]
-    base_objective = base_metric_data[target_obj_idx]
+    base_objective = base_metric_data[prev_obj_idx]
+    prev_objective = prev_metric_data[prev_obj_idx]
     metric_meta = db.target_objectives.get_metric_metadata(
         result.session.dbms.pk, result.session.target_objective)
 
     # Calculate the reward
-    objective = objective / base_objective
-    if metric_meta[target_objective].improvement == '(less is better)':
-        reward = -objective
+    if DDPG_SIMPLE_REWARD:
+        objective = objective / base_objective
+        if metric_meta[target_objective].improvement == '(less is better)':
+            reward = -objective
+        else:
+            reward = objective
     else:
-        reward = objective
+        if metric_meta[target_objective].improvement == '(less is better)':
+            if objective - base_objective <= 0:  # positive reward
+                reward = (np.square((2 * base_objective - objective) / base_objective) - 1)\
+                    * abs(2 * prev_objective - objective) / prev_objective
+            else:  # negative reward
+                reward = -(np.square(objective / base_objective) - 1) * objective / prev_objective
+        else:
+            if objective - base_objective > 0:  # positive reward
+                reward = (np.square(objective / base_objective) - 1) * objective / prev_objective
+            else:  # negative reward
+                reward = -(np.square((2 * base_objective - objective) / base_objective) - 1)\
+                    * abs(2 * prev_objective - objective) / prev_objective
     LOG.info('reward: %f', reward)
 
     # Update ddpg
     ddpg = DDPG(n_actions=knob_num, n_states=metric_num, alr=ACTOR_LEARNING_RATE,
-                clr=CRITIC_LEARNING_RATE, gamma=0, batch_size=DDPG_BATCH_SIZE,
-                a_hidden_sizes=ACTOR_HIDDEN_SIZES, c_hidden_sizes=CRITIC_HIDDEN_SIZES)
+                clr=CRITIC_LEARNING_RATE, gamma=DDPG_GAMMA, batch_size=DDPG_BATCH_SIZE,
+                a_hidden_sizes=ACTOR_HIDDEN_SIZES, c_hidden_sizes=CRITIC_HIDDEN_SIZES,
+                use_default=USE_DEFAULT)
     if session.ddpg_actor_model and session.ddpg_critic_model:
         ddpg.set_model(session.ddpg_actor_model, session.ddpg_critic_model)
     if session.ddpg_reply_memory:
@@ -358,7 +426,8 @@ def configuration_recommendation_ddpg(result_info):  # pylint: disable=invalid-n
     result = Result.objects.filter(pk=result_id)
     session = Result.objects.get(pk=result_id).session
     agg_data = DataUtil.aggregate_data(result)
-    metric_data = agg_data['y_matrix'].flatten()
+    metric_data, _ = clean_metric_data(agg_data['y_matrix'], agg_data['y_columnlabels'], session)
+    metric_data = metric_data.flatten()
     metric_scalar = MinMaxScaler().fit(metric_data.reshape(1, -1))
     normalized_metric_data = metric_scalar.transform(metric_data.reshape(1, -1))[0]
     cleaned_knob_data = clean_knob_data(agg_data['X_matrix'], agg_data['X_columnlabels'],
@@ -368,7 +437,7 @@ def configuration_recommendation_ddpg(result_info):  # pylint: disable=invalid-n
     metric_num = len(metric_data)
 
     ddpg = DDPG(n_actions=knob_num, n_states=metric_num, a_hidden_sizes=ACTOR_HIDDEN_SIZES,
-                c_hidden_sizes=CRITIC_HIDDEN_SIZES)
+                c_hidden_sizes=CRITIC_HIDDEN_SIZES, use_default=USE_DEFAULT)
     if session.ddpg_actor_model is not None and session.ddpg_critic_model is not None:
         ddpg.set_model(session.ddpg_actor_model, session.ddpg_critic_model)
     if session.ddpg_reply_memory is not None:
@@ -386,22 +455,7 @@ def configuration_recommendation_ddpg(result_info):  # pylint: disable=invalid-n
     return conf_map_res
 
 
-@task(base=ConfigurationRecommendation, name='configuration_recommendation')
-def configuration_recommendation(recommendation_input):
-    target_data, algorithm = recommendation_input
-    LOG.info('configuration_recommendation called')
-
-    if target_data['bad'] is True:
-        target_data_res = dict(
-            status='bad',
-            result_id=target_data['newest_result_id'],
-            info='WARNING: no training data, the config is generated randomly',
-            recommendation=target_data['config_recommend'],
-            pipeline_run=target_data['pipeline_run'])
-        LOG.debug('%s: Skipping configuration recommendation.\n\ndata=%s\n',
-                  AlgorithmType.name(algorithm), JSONUtil.dumps(target_data, pprint=True))
-        return target_data_res
-
+def combine_workload(target_data):
     # Load mapped workload data
     mapped_workload_id = target_data['mapped_workload'][0]
 
@@ -437,10 +491,12 @@ def configuration_recommendation(recommendation_input):
 
     if not np.array_equal(X_columnlabels, target_data['X_columnlabels']):
         raise Exception(('The workload and target data should have '
-                         'identical X columnlabels (sorted knob names)'))
+                         'identical X columnlabels (sorted knob names)'),
+                        X_columnlabels, target_data['X_columnlabels'])
     if not np.array_equal(y_columnlabels, target_data['y_columnlabels']):
         raise Exception(('The workload and target data should have '
-                         'identical y columnlabels (sorted metric names)'))
+                         'identical y columnlabels (sorted metric names)'),
+                        y_columnlabels, target_data['y_columnlabels'])
 
     # Filter Xs by top 10 ranked knobs
     ranked_knobs = PipelineData.objects.get(
@@ -463,10 +519,6 @@ def configuration_recommendation(recommendation_input):
         raise Exception(('Found {} instances of target objective in '
                          'metrics (target_obj={})').format(len(target_obj_idx),
                                                            target_objective))
-
-    metric_meta = db.target_objectives.get_metric_metadata(
-        newest_result.session.dbms.pk, newest_result.session.target_objective)
-    lessisbetter = metric_meta[target_objective].improvement == db.target_objectives.LESS_IS_BETTER
 
     y_workload = y_workload[:, target_obj_idx]
     y_target = y_target[:, target_obj_idx]
@@ -493,17 +545,23 @@ def configuration_recommendation(recommendation_input):
     X_matrix = np.vstack([X_target, X_workload])
 
     # Dummy encode categorial variables
-    categorical_info = DataUtil.dummy_encoder_helper(X_columnlabels,
-                                                     mapped_workload.dbms)
-    dummy_encoder = DummyEncoder(categorical_info['n_values'],
-                                 categorical_info['categorical_features'],
-                                 categorical_info['cat_columnlabels'],
-                                 categorical_info['noncat_columnlabels'])
-    X_matrix = dummy_encoder.fit_transform(X_matrix)
-
-    # below two variables are needed for correctly determing max/min on dummies
-    binary_index_set = set(categorical_info['binary_vars'])
-    total_dummies = dummy_encoder.total_dummies()
+    if ENABLE_DUMMY_ENCODER:
+        categorical_info = DataUtil.dummy_encoder_helper(X_columnlabels,
+                                                         mapped_workload.dbms)
+        dummy_encoder = DummyEncoder(categorical_info['n_values'],
+                                     categorical_info['categorical_features'],
+                                     categorical_info['cat_columnlabels'],
+                                     categorical_info['noncat_columnlabels'])
+        X_matrix = dummy_encoder.fit_transform(X_matrix)
+        binary_encoder = categorical_info['binary_vars']
+        # below two variables are needed for correctly determing max/min on dummies
+        binary_index_set = set(categorical_info['binary_vars'])
+        total_dummies = dummy_encoder.total_dummies()
+    else:
+        dummy_encoder = None
+        binary_encoder = None
+        binary_index_set = []
+        total_dummies = 0
 
     # Scale to N(0, 1)
     X_scaler = StandardScaler()
@@ -530,10 +588,18 @@ def configuration_recommendation(recommendation_input):
             y_workload_scaler = StandardScaler()
             y_scaled = y_workload_scaler.fit_transform(y_target)
 
+    metric_meta = db.target_objectives.get_metric_metadata(
+        newest_result.session.dbms.pk, newest_result.session.target_objective)
+    lessisbetter = metric_meta[target_objective].improvement == db.target_objectives.LESS_IS_BETTER
+    # Maximize the throughput, moreisbetter
+    # Use gradient descent to minimize -throughput
+    if not lessisbetter:
+        y_scaled = -y_scaled
+
     # Set up constraint helper
     constraint_helper = ParamConstraintHelper(scaler=X_scaler,
                                               encoder=dummy_encoder,
-                                              binary_vars=categorical_info['binary_vars'],
+                                              binary_vars=binary_encoder,
                                               init_flip_prob=INIT_FLIP_PROB,
                                               flip_prob_decay=FLIP_PROB_DECAY)
 
@@ -542,10 +608,6 @@ def configuration_recommendation(recommendation_input):
     # ridge[:X_target.shape[0]] = 0.01
     # ridge[X_target.shape[0]:] = 0.1
 
-    # FIXME: we should generate more samples and use a smarter sampling
-    # technique
-    num_samples = NUM_SAMPLES
-    X_samples = np.empty((num_samples, X_scaled.shape[1]))
     X_min = np.empty(X_scaled.shape[1])
     X_max = np.empty(X_scaled.shape[1])
     X_scaler_matrix = np.zeros([1, X_scaled.shape[1]])
@@ -568,12 +630,37 @@ def configuration_recommendation(recommendation_input):
                     col_max = X_scaler.transform(X_scaler_matrix)[0][i]
         X_min[i] = col_min
         X_max[i] = col_max
-        X_samples[:, i] = np.random.rand(num_samples) * (col_max - col_min) + col_min
 
-    # Maximize the throughput, moreisbetter
-    # Use gradient descent to minimize -throughput
-    if not lessisbetter:
-        y_scaled = -y_scaled
+    return X_columnlabels, X_scaler, X_scaled, y_scaled, X_max, X_min
+
+
+@task(base=ConfigurationRecommendation, name='configuration_recommendation')
+def configuration_recommendation(recommendation_input):
+    target_data, algorithm = recommendation_input
+    LOG.info('configuration_recommendation called')
+
+    if target_data['bad'] is True:
+        target_data_res = dict(
+            status='bad',
+            result_id=target_data['newest_result_id'],
+            info='WARNING: no training data, the config is generated randomly',
+            recommendation=target_data['config_recommend'],
+            pipeline_run=target_data['pipeline_run'])
+        LOG.debug('%s: Skipping configuration recommendation.\n\ndata=%s\n',
+                  AlgorithmType.name(algorithm), JSONUtil.dumps(target_data, pprint=True))
+        return target_data_res
+
+    latest_pipeline_run = PipelineRun.objects.get(pk=target_data['pipeline_run'])
+    newest_result = Result.objects.get(pk=target_data['newest_result_id'])
+
+    X_columnlabels, X_scaler, X_scaled, y_scaled, X_max, X_min = combine_workload(target_data)
+
+    # FIXME: we should generate more samples and use a smarter sampling
+    # technique
+    num_samples = NUM_SAMPLES
+    X_samples = np.empty((num_samples, X_scaled.shape[1]))
+    for i in range(X_scaled.shape[1]):
+        X_samples[:, i] = np.random.rand(num_samples) * (X_max[i] - X_min[i]) + X_min[i]
 
     q = queue.PriorityQueue()
     for x in range(0, y_scaled.shape[0]):
@@ -627,13 +714,13 @@ def configuration_recommendation(recommendation_input):
             opt_kwargs['learning_rate'] = DEFAULT_LEARNING_RATE
             opt_kwargs['maxiter'] = MAX_ITER
             opt_kwargs['bounds'] = [X_min, X_max]
-            ucb_beta = 'get_beta_td'
-            opt_kwargs['ucb_beta'] = ucb.get_ucb_beta(ucb_beta, scale=DEFAULT_UCB_SCALE,
+            opt_kwargs['debug'] = GPR_DEBUG
+            opt_kwargs['ucb_beta'] = ucb.get_ucb_beta(UCB_BETA, scale=DEFAULT_UCB_SCALE,
                                                       t=i + 1., ndim=X_scaled.shape[1])
             tf.reset_default_graph()
             graph = tf.get_default_graph()
             gpflow.reset_default_session(graph=graph)
-            m = gpr_models.create_model('BasicGP', X=X_scaled, y=y_scaled, **model_kwargs)
+            m = gpr_models.create_model(GPR_MODEL_NAME, X=X_scaled, y=y_scaled, **model_kwargs)
             res = tf_optimize(m.model, X_samples, **opt_kwargs)
         else:
             model = GPRGD(length_scale=DEFAULT_LENGTH_SCALE,
@@ -645,15 +732,18 @@ def configuration_recommendation(recommendation_input):
                           epsilon=DEFAULT_EPSILON,
                           max_iter=MAX_ITER,
                           sigma_multiplier=DEFAULT_SIGMA_MULTIPLIER,
-                          mu_multiplier=DEFAULT_MU_MULTIPLIER)
-            model.fit(X_scaled, y_scaled, X_min, X_max, ridge=DEFAULT_RIDGE)
+                          mu_multiplier=DEFAULT_MU_MULTIPLIER,
+                          ridge=DEFAULT_RIDGE)
+            model.fit(X_scaled, y_scaled, X_min, X_max)
             res = model.predict(X_samples, constraint_helper=constraint_helper)
 
     best_config_idx = np.argmin(res.minl.ravel())
     best_config = res.minl_conf[best_config_idx, :]
     best_config = X_scaler.inverse_transform(best_config)
-    # Decode one-hot encoding into categorical knobs
-    best_config = dummy_encoder.inverse_transform(best_config)
+
+    if ENABLE_DUMMY_ENCODER:
+        # Decode one-hot encoding into categorical knobs
+        best_config = dummy_encoder.inverse_transform(best_config)
 
     # Although we have max/min limits in the GPRGD training session, it may
     # lose some precisions. e.g. 0.99..99 >= 1.0 may be True on the scaled data,
@@ -712,7 +802,8 @@ def map_workload(map_workload_input):
     pipeline_data = PipelineData.objects.filter(
         pipeline_run=latest_pipeline_run,
         workload__dbms=target_workload.dbms,
-        workload__hardware=target_workload.hardware)
+        workload__hardware=target_workload.hardware,
+        workload__project=target_workload.project)
 
     # FIXME (dva): we should also compute the global (i.e., overall) ranked_knobs
     # and pruned metrics but we just use those from the first workload for now

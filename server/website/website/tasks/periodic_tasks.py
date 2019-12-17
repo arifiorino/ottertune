@@ -18,6 +18,7 @@ from analysis.preprocessing import (Bin, get_shuffle_indices,
                                     DummyEncoder,
                                     consolidate_columnlabels)
 from website.models import PipelineData, PipelineRun, Result, Workload
+from website.settings import RUN_EVERY, ENABLE_DUMMY_ENCODER
 from website.types import PipelineTaskType, WorkloadStatusType
 from website.utils import DataUtil, JSONUtil
 
@@ -27,8 +28,8 @@ LOG = get_task_logger(__name__)
 MIN_WORKLOAD_RESULTS_COUNT = 5
 
 
-# Run the background tasks every 5 minutes
-@periodic_task(run_every=300, name="run_background_tasks")
+# Run the background tasks every 'RUN_EVERY' seconds
+@periodic_task(run_every=RUN_EVERY, name="run_background_tasks")
 def run_background_tasks():
     LOG.debug("Starting background tasks")
     # Find modified and not modified workloads, we only have to calculate for the
@@ -295,18 +296,22 @@ def run_knob_identification(knob_data, metric_data, dbms):
             nonconst_metric_columnlabels.append(cl)
     nonconst_metric_matrix = np.hstack(nonconst_metric_matrix)
 
-    # determine which knobs need encoding (enums with >2 possible values)
+    if ENABLE_DUMMY_ENCODER:
+        # determine which knobs need encoding (enums with >2 possible values)
 
-    categorical_info = DataUtil.dummy_encoder_helper(nonconst_knob_columnlabels,
-                                                     dbms)
-    # encode categorical variable first (at least, before standardize)
-    dummy_encoder = DummyEncoder(categorical_info['n_values'],
-                                 categorical_info['categorical_features'],
-                                 categorical_info['cat_columnlabels'],
-                                 categorical_info['noncat_columnlabels'])
-    encoded_knob_matrix = dummy_encoder.fit_transform(
-        nonconst_knob_matrix)
-    encoded_knob_columnlabels = dummy_encoder.new_labels
+        categorical_info = DataUtil.dummy_encoder_helper(nonconst_knob_columnlabels,
+                                                         dbms)
+        # encode categorical variable first (at least, before standardize)
+        dummy_encoder = DummyEncoder(categorical_info['n_values'],
+                                     categorical_info['categorical_features'],
+                                     categorical_info['cat_columnlabels'],
+                                     categorical_info['noncat_columnlabels'])
+        encoded_knob_matrix = dummy_encoder.fit_transform(
+            nonconst_knob_matrix)
+        encoded_knob_columnlabels = dummy_encoder.new_labels
+    else:
+        encoded_knob_columnlabels = nonconst_knob_columnlabels
+        encoded_knob_matrix = nonconst_knob_matrix
 
     # standardize values in each column to N(0, 1)
     standardizer = StandardScaler()

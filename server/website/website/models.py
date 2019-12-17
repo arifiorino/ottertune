@@ -184,15 +184,23 @@ class SessionKnobManager(models.Manager):
     @staticmethod
     def get_knobs_for_session(session):
         # Returns a dict of the knob
-        knobs = KnobCatalog.objects.filter(dbms=session.dbms)
-        knob_dicts = list(knobs.values())
-        for i, _ in enumerate(knob_dicts):
-            if SessionKnob.objects.filter(session=session, knob=knobs[i]).exists():
-                new_knob = SessionKnob.objects.filter(session=session, knob=knobs[i])[0]
-                knob_dicts[i]["minval"] = new_knob.minval
-                knob_dicts[i]["maxval"] = new_knob.maxval
-                knob_dicts[i]["tunable"] = new_knob.tunable
-        knob_dicts = [knob for knob in knob_dicts if knob["tunable"]]
+        session_knobs = SessionKnob.objects.filter(
+            session=session, tunable=True).prefetch_related('knob')
+        session_knobs = {s.knob.pk: s for s in session_knobs}
+        knob_dicts = list(KnobCatalog.objects.filter(id__in=session_knobs.keys()).values())
+        for knob_dict in knob_dicts:
+            sess_knob = session_knobs[knob_dict['id']]
+            knob_dict['minval'] = sess_knob.minval
+            knob_dict['maxval'] = sess_knob.maxval
+            knob_dict['tunable'] = sess_knob.tunable
+            if knob_dict['vartype'] is VarType.ENUM:
+                enumvals = knob_dict['enumvals'].split(',')
+                knob_dict["minval"] = 0
+                knob_dict["maxval"] = len(enumvals) - 1
+            if knob_dict['vartype'] is VarType.BOOL:
+                knob_dict["minval"] = 0
+                knob_dict["maxval"] = 1
+
         return knob_dicts
 
     @staticmethod
@@ -309,14 +317,15 @@ class MetricData(DataModel):
 
 class WorkloadManager(models.Manager):
 
-    def create_workload(self, dbms, hardware, name):
+    def create_workload(self, dbms, hardware, name, project):
         # (dbms,hardware,name) should be unique for each workload
         try:
-            return Workload.objects.get(dbms=dbms, hardware=hardware, name=name)
+            return Workload.objects.get(dbms=dbms, hardware=hardware, name=name, project=project)
         except Workload.DoesNotExist:
             return self.create(dbms=dbms,
                                hardware=hardware,
-                               name=name)
+                               name=name,
+                               project=project)
 
 
 class Workload(BaseModel):
@@ -328,6 +337,7 @@ class Workload(BaseModel):
     dbms = models.ForeignKey(DBMSCatalog)
     hardware = models.ForeignKey(Hardware)
     name = models.CharField(max_length=128, verbose_name='workload name')
+    project = models.ForeignKey(Project)
     status = models.IntegerField(choices=WorkloadStatusType.choices(),
                                  default=WorkloadStatusType.MODIFIED,
                                  editable=False)
@@ -345,7 +355,7 @@ class Workload(BaseModel):
         super(Workload, self).delete(using, keep_parents)
 
     class Meta:  # pylint: disable=no-init
-        unique_together = ("dbms", "hardware", "name")
+        unique_together = ("dbms", "hardware", "name", "project")
 
     # @property
     # def isdefault(self):

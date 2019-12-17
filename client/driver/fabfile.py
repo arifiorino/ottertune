@@ -425,13 +425,17 @@ def upload_batch(result_dir=None, sort=True, upload_code=None):
         upload_result(result_dir=result_dir, prefix=prefix, upload_code=upload_code)
         LOG.info('Uploaded result %d/%d: %s__*.json', i + 1, count, prefix)
 
-
 @task
 def dump_database():
     dumpfile = os.path.join(dconf.DB_DUMP_DIR, dconf.DB_NAME + '.dump')
-    if not dconf.ORACLE_FLASH_BACK and file_exists(dumpfile):
-        LOG.info('%s already exists ! ', dumpfile)
-        return False
+    if dconf.DB_TYPE == 'oracle':
+        if not dconf.ORACLE_FLASH_BACK and file_exists(dumpfile):
+            LOG.info('%s already exists ! ', dumpfile)
+            return False
+    else:
+        if file_exists(dumpfile):
+            LOG.info('%s already exists ! ', dumpfile)
+            return False
 
     if dconf.ORACLE_FLASH_BACK:
         LOG.info('create restore point %s for database %s in %s', dconf.RESTORE_POINT,
@@ -530,22 +534,6 @@ def loop(i):
 
     # remove oltpbench log and controller log
     clean_logs()
-    # restart database
-    restart_succeeded = restart_database()
-    if not restart_succeeded:
-        files = {'summary': b'{"error": "DB_RESTART_ERROR"}',
-                 'knobs': b'{}',
-                 'metrics_before': b'{}',
-                 'metrics_after': b'{}'}
-        response = requests.post(dconf.WEBSITE_URL + '/new_result/', files=files,
-                                 data={'upload_code': dconf.UPLOAD_CODE})
-        response = get_result()
-        result_timestamp = int(time.time())
-        save_next_config(response, t=result_timestamp)
-        change_conf(response['recommendation'])
-        return
-
-    time.sleep(dconf.RESTART_SLEEP_SEC)
 
     # check disk usage
     if check_disk_usage() > dconf.MAX_DISK_USAGE:
@@ -598,19 +586,35 @@ def loop(i):
 
 
 @task
-def run_loops(max_iter=1):
+def run_loops(max_iter=10):
     # dump database if it's not done before.
     dump = dump_database()
 
     for i in range(int(max_iter)):
+        # restart database
+        restart_succeeded = restart_database()
+        if not restart_succeeded:
+            files = {'summary': b'{"error": "DB_RESTART_ERROR"}',
+                     'knobs': b'{}',
+                     'metrics_before': b'{}',
+                     'metrics_after': b'{}'}
+            response = requests.post(dconf.WEBSITE_URL + '/new_result/', files=files,
+                                     data={'upload_code': dconf.UPLOAD_CODE})
+            response = get_result()
+            result_timestamp = int(time.time())
+            save_next_config(response, t=result_timestamp)
+            change_conf(response['recommendation'])
+            continue
+
+        # reload database periodically
         if dconf.RELOAD_INTERVAL > 0:
             if i % dconf.RELOAD_INTERVAL == 0:
                 if i == 0 and dump is False:
-                    restart_database()
                     restore_database()
                 elif i > 0:
                     restore_database()
 
+        time.sleep(dconf.RESTART_SLEEP_SEC)
         LOG.info('The %s-th Loop Starts / Total Loops %s', i + 1, max_iter)
         loop(i % dconf.RELOAD_INTERVAL if dconf.RELOAD_INTERVAL > 0 else i)
         LOG.info('The %s-th Loop Ends / Total Loops %s', i + 1, max_iter)
@@ -744,21 +748,33 @@ def integration_tests():
 
     # Upload training data
     LOG.info('Upload training data to no tuning session')
-    upload_batch(result_dir='../../integrationTests/data/', upload_code='ottertuneTestNoTuning')
+    upload_batch(result_dir='./integrationTests/data/', upload_code='ottertuneTestNoTuning')
 
     # wait celery periodic task finishes
     assert wait_pipeline_data_ready(), "Pipeline data failed"
 
     # Test DNN
     LOG.info('Test DNN (deep neural network)')
-    upload_result(result_dir='../../integrationTests/data/', prefix='0__',
+    upload_result(result_dir='./integrationTests/data/', prefix='0__',
                   upload_code='ottertuneTestTuningDNN')
     response = get_result(upload_code='ottertuneTestTuningDNN')
     assert response['status'] == 'good'
 
     # Test GPR
     LOG.info('Test GPR (gaussian process regression)')
-    upload_result(result_dir='../../integrationTests/data/', prefix='0__',
+    upload_result(result_dir='./integrationTests/data/', prefix='0__',
+                  upload_code='ottertuneTestTuningGPR')
+    response = get_result(upload_code='ottertuneTestTuningGPR')
+    assert response['status'] == 'good'
+
+    # Test DNN: 2rd iteration
+    upload_result(result_dir='./integrationTests/data/', prefix='1__',
+                  upload_code='ottertuneTestTuningDNN')
+    response = get_result(upload_code='ottertuneTestTuningDNN')
+    assert response['status'] == 'good'
+
+    # Test GPR: 2rd iteration
+    upload_result(result_dir='./integrationTests/data/', prefix='1__',
                   upload_code='ottertuneTestTuningGPR')
     response = get_result(upload_code='ottertuneTestTuningGPR')
     assert response['status'] == 'good'

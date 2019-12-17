@@ -7,6 +7,7 @@
 import logging
 import datetime
 import re
+import time
 from collections import OrderedDict
 
 from django.contrib.auth import authenticate, login, logout
@@ -360,18 +361,13 @@ def edit_knobs(request, project_id, session_id):
         instance.save()
         return HttpResponse(status=204)
     else:
-        # knobs = KnobCatalog.objects.filter(dbms=session.dbms).order_by('-tunable')
-        knobs = SessionKnob.objects.filter(session=session).order_by('-tunable', 'knob__name')
+        knobs = SessionKnob.objects.filter(session=session).prefetch_related(
+            'knob').order_by('-tunable', 'knob__name')
         forms = []
         for knob in knobs:
             knob_values = model_to_dict(knob)
             knob_values['session'] = session
-            knob_values['name'] = KnobCatalog.objects.get(pk=knob.knob.pk).name
-            # if SessionKnob.objects.filter(session=session, knob=knob).exists():
-            #     new_knob = SessionKnob.objects.filter(session=session, knob=knob)[0]
-            #     knob_values["minval"] = new_knob.minval
-            #     knob_values["maxval"] = new_knob.maxval
-            #     knob_values["tunable"] = new_knob.tunable
+            knob_values['name'] = knob.knob.name
             forms.append(SessionKnobForm(initial=knob_values))
         context = {
             'project': project,
@@ -461,19 +457,19 @@ def handle_result_files(session, files):
 
         LOG.debug("Error in restarting database")
         # Find worst throughput
-        past_configs = MetricData.objects.filter(session=session)
-        worst_throughput = None
-        for curr_config in past_configs:
-            throughput = JSONUtil.loads(curr_config.data)[session.target_objective]
+        past_metrics = MetricData.objects.filter(session=session)
+        worst_target_value = None
+        for past_metric in past_metrics:
+            target_value = JSONUtil.loads(past_metric.data)[session.target_objective]
             metric_meta = target_objectives.get_instance(
                 session.dbms.pk, session.target_objective)
             if metric_meta.improvement == target_objectives.MORE_IS_BETTER:
-                if worst_throughput is None or throughput < worst_throughput:
-                    worst_throughput = throughput
+                if worst_target_value is None or target_value < worst_target_value:
+                    worst_target_value = target_value
             else:
-                if worst_throughput is None or throughput > worst_throughput:
-                    worst_throughput = throughput
-        LOG.debug("Worst throughput so far is:%d", worst_throughput)
+                if worst_target_value is None or target_value > worst_target_value:
+                    worst_target_value = target_value
+        LOG.debug("Worst target value so far is: %d", worst_target_value)
 
         result = Result.objects.filter(session=session).order_by("-id").first()
         backup_data = BackupData.objects.filter(result=result).first()
@@ -491,20 +487,11 @@ def handle_result_files(session, files):
         knob_data.knobs = JSONUtil.dumps(all_knobs)
 
         data_knobs = JSONUtil.loads(knob_data.data)
+        last_conf = parser.convert_dbms_knobs(result.dbms.pk, last_conf)
         for knob in data_knobs.keys():
             for tunable_knob in last_conf.keys():
                 if tunable_knob in knob:
-                    unit = KnobCatalog.objects.get(dbms=session.dbms, name=knob).unit
-                    bytes_system = ConversionUtil.DEFAULT_BYTES_SYSTEM
-                    time_system = ConversionUtil.DEFAULT_TIME_SYSTEM
-                    if unit == 1:
-                        data_knobs[knob] = ConversionUtil.get_raw_size(last_conf[tunable_knob],
-                                                                       bytes_system)
-                    elif unit == 2:
-                        data_knobs[knob] = ConversionUtil.get_raw_size(last_conf[tunable_knob],
-                                                                       time_system)
-                    else:
-                        data_knobs[knob] = last_conf[tunable_knob]
+                    data_knobs[knob] = last_conf[tunable_knob]
 
         knob_data.data = JSONUtil.dumps(data_knobs)
         knob_data.name = knob_data.name + '*'
@@ -514,7 +501,7 @@ def handle_result_files(session, files):
 
         metric_data = result.metric_data
         metric_cpy = JSONUtil.loads(metric_data.data)
-        metric_cpy["throughput_txn_per_sec"] = worst_throughput
+        metric_cpy[session.target_objective] = worst_target_value
         metric_cpy = JSONUtil.dumps(metric_cpy)
         metric_data.pk = None
         metric_data.name = metric_data.name + '*'
@@ -596,7 +583,7 @@ def handle_result_files(session, files):
 
         # Create a new workload if this one does not already exist
         workload = Workload.objects.create_workload(
-            dbms, session.hardware, workload_name)
+            dbms, session.hardware, workload_name, session.project)
 
         # Save this result
         result = Result.objects.create_result(
@@ -604,7 +591,7 @@ def handle_result_files(session, files):
             start_time, end_time, observation_time)
         result.save()
 
-        # Workload is now modified so backgroundTasks can make calculationw
+        # Workload is now modified so backgroundTasks can make calculation
         workload.status = WorkloadStatusType.MODIFIED
         workload.save()
 
@@ -1084,16 +1071,22 @@ def give_result(request, upload_code):  # pylint: disable=unused-argument
     overall_status, num_completed = TaskUtil.get_task_status(tasks)
 
     if overall_status == 'SUCCESS':
-        if not latest_result.next_configuration:
-            # If the task status was incomplete when we first queried latest_result
-            # but succeeded before the call to TaskUtil.get_task_status() finished
-            # then latest_result is stale and must be updated.
-            LOG.debug("Updating stale result (pk=%s)", latest_result.pk)
+        # The task status is set to SUCCESS before the next config is saved in
+        # the latest result so we must wait for it to be updated
+        max_wait_sec = 20
+        elapsed_sec = 0
+        while not latest_result.next_configuration and elapsed_sec <= max_wait_sec:
+            time.sleep(5)
+            elapsed_sec += 5
             latest_result = Result.objects.get(id=latest_result.pk)
+            LOG.debug("Waiting for the next config for result %s to be updated... "
+                      "(elapsed: %ss): %s", latest_result.pk, elapsed_sec,
+                      model_to_dict(latest_result))
 
         if not latest_result.next_configuration:
-            LOG.warning("Failed to get the next configuration from the latest result: %s",
-                        model_to_dict(latest_result))
+            LOG.warning(
+                "Failed to get the next configuration from the latest result after %ss: %s",
+                elapsed_sec, model_to_dict(latest_result))
             overall_status = 'FAILURE'
             response = _failed_response(latest_result, tasks, num_completed, overall_status,
                                         'Failed to get the next configuration.')
@@ -1134,6 +1127,31 @@ def train_ddpg_loops(request, session_id):  # pylint: disable=unused-argument
     for result in results:
         train_ddpg(result.pk)
     return HttpResponse()
+
+
+@csrf_exempt
+def alt_get_info(request, name):  # pylint: disable=unused-argument
+    # Backdoor method for getting basic info
+    if name == 'constants':
+        info = utils.get_constants()
+        response = HttpResponse(JSONUtil.dumps(info))
+    else:
+        LOG.warning("Invalid name for info request: %s", name)
+        response = HttpResponse("Invalid name for info request: {}".format(name), status=400)
+    return response
+
+
+@csrf_exempt
+def alt_set_constants(request):
+    constants = JSONUtil.loads(request.POST.get('constants', '{}'))
+    for name, value in constants.items():
+        try:
+            utils.set_constant(name, value)
+        except AttributeError as e:
+            LOG.warning(e)
+            return HttpResponse(e, status=400)
+    return HttpResponse("Successfully updated constants: {}".format(
+        ', '.join('{}={}'.format(k, v) for k, v in constants.items())))
 
 
 @csrf_exempt
@@ -1303,7 +1321,7 @@ def alt_create_or_edit_session(request):
                                              upload_code=upload_code, creation_time=ts,
                                              last_update=ts, **data)
         except IntegrityError:
-            err_msg = "ERROR: Project '{}' already exists.".format(session_name)
+            err_msg = "ERROR: Session '{}' already exists.".format(session_name)
             session = Session.objects.get(user=user, project=project, name=session_name)
             response.update(error=err_msg, project=model_to_dict(session))
             LOG.warning(err_msg)
@@ -1314,6 +1332,12 @@ def alt_create_or_edit_session(request):
         session = get_object_or_404(Session, name=session_name, project=project, user=user)
         for k, v in data.items():
             setattr(session, k, v)
+
+        # Corner case: when running LHS, when the tunable knobs and/or their ranges change
+        # then we must delete the pre-generated configs since they are no longer valid.
+        if session_knobs and session.tuning_session == 'lhs':
+            session.lhs_samples = '[]'
+
         session.last_update = ts
         session.save()
 
@@ -1321,7 +1345,6 @@ def alt_create_or_edit_session(request):
         session_knobs = JSONUtil.loads(session_knobs)
         SessionKnob.objects.set_knob_min_max_tunability(session, session_knobs,
                                                         disable_others=disable_others)
-
     res = model_to_dict(session)
     res['dbms_id'] = res['dbms']
     res['dbms'] = session.dbms.full_name

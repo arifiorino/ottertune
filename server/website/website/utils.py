@@ -113,7 +113,14 @@ class DataUtil(object):
             knob_object = KnobCatalog.objects.get(dbms=session.dbms, name=knob, tunable=True)
             knob_session_object = SessionKnob.objects.filter(knob=knob_object, session=session,
                                                              tunable=True)
-            if knob_session_object.exists():
+            if knob_object.vartype is VarType.ENUM:
+                enumvals = knob_object.enumvals.split(',')
+                minval = 0
+                maxval = len(enumvals) - 1
+            elif knob_object.vartype is VarType.BOOL:
+                minval = 0
+                maxval = 1
+            elif knob_session_object.exists():
                 minval = float(knob_session_object[0].minval)
                 maxval = float(knob_session_object[0].maxval)
             else:
@@ -335,6 +342,19 @@ class LabelUtil(object):
         return style_labels
 
 
+def set_constant(name, value):
+    getattr(constants, name)  # Throw exception if not a valid option
+    setattr(constants, name, value)
+
+
+def get_constants():
+    constants_dict = OrderedDict()
+    for name, value in sorted(constants.__dict__.items()):
+        if not name.startswith('_') and name == name.upper():
+            constants_dict[name] = value
+    return constants_dict
+
+
 def dump_debug_info(session, pretty_print=False):
     files = {}
 
@@ -411,11 +431,7 @@ def dump_debug_info(session, pretty_print=False):
         files['logs/{}.log'.format(logger_name)] = log_values
 
     # Save settings
-    constants_dict = OrderedDict()
-    for name, value in sorted(constants.__dict__.items()):
-        if not name.startswith('_') and name == name.upper():
-            constants_dict[name] = value
-    files['constants.json'] = constants_dict
+    files['constants.json'] = get_constants()
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     root = 'debug_{}'.format(timestamp)

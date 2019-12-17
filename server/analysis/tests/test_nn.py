@@ -26,7 +26,8 @@ class TestNN(unittest.TestCase):
         np.random.seed(0)
         set_random_seed(0)
         cls.model = NeuralNet(n_input=X_test.shape[1],
-                              batch_size=X_test.shape[0])
+                              batch_size=X_test.shape[0],
+                              reset_seed=True)
         cls.model.fit(X_train, y_train)
         cls.nn_result = cls.model.predict(X_test)
         cls.nn_recommend = cls.model.recommend(X_test)

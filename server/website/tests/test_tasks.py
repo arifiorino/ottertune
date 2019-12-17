@@ -7,7 +7,7 @@ import copy
 import numpy as np
 from django.test import TestCase, override_settings
 from django.db import transaction
-from website.models import (Workload, PipelineRun, PipelineData,
+from website.models import (Workload, PipelineRun, PipelineData, Project,
                             Result, Session, DBMSCatalog, Hardware)
 from website.tasks.periodic_tasks import (run_background_tasks,
                                           aggregate_data,
@@ -50,7 +50,8 @@ class BackgroundTestCase(TestCase):
             # Create empty workload
             empty_workload = Workload.objects.create_workload(dbms=DBMSCatalog.objects.get(pk=1),
                                                               hardware=Hardware.objects.get(pk=1),
-                                                              name="empty_workload")
+                                                              name="empty_workload",
+                                                              project=Project.objects.get(pk=1))
 
             result = run_background_tasks.delay()
         # Check that BG task successfully finished
@@ -69,7 +70,8 @@ class BackgroundTestCase(TestCase):
         # Create empty workload
         fix_workload = Workload.objects.create_workload(dbms=origin_workload.dbms,
                                                         hardware=origin_workload.hardware,
-                                                        name="fixed_knob_workload")
+                                                        name="fixed_knob_workload",
+                                                        project=origin_workload.project)
 
         fix_knob_data = Result.objects.filter(workload=origin_workload,
                                               session=origin_session)[0].knob_data

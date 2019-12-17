@@ -36,6 +36,63 @@ from operator import itemgetter
 # cursor_sharing
 
 
+EXTRA_KNOBS = {
+    '_pga_max_size': {
+        'default': 200000000,
+    },
+    '_smm_max_size': {
+        'default': 100000,
+    },
+    '_smm_px_max_size': {
+        'default': 300000,
+    },
+    '_optimizer_use_feedback': {
+        'default': True,
+        'minval': None,
+        'maxval': None,
+        'vartype': 4,
+    },
+    'ioseektim': {
+        'default': 10,
+        'minval': 1,
+        'maxval': 10,
+    },
+    'iotfrspeed': {
+        'default': 4096,
+        'minval': 4096,
+        'maxval': 190000,
+    },
+    '_enable_numa_optimization': {
+        'default': False,
+        'minval': None,
+        'maxval': None,
+        'vartype': 4,
+    },
+}
+
+
+def add_fields(fields_list, version):
+    for name, custom_fields in EXTRA_KNOBS.items():
+        new_field = dict(
+            name=('global.' + name).lower(),
+            scope='global',
+            dbms=version,
+            category='',
+            enumvals=None,
+            context='',
+            unit=3,  # other
+            tunable=False,
+            description='',
+            summary='',
+            vartype=2,  # integer
+            minval=0,
+            maxval=2000000000,
+            default=500000,
+        )
+        new_field.update(custom_fields)
+        fields_list.append(new_field)
+
+
 def set_field(fields):
     if fields['name'].upper() == 'MEMORY_TARGET':
         fields['tunable'] = False
@@ -98,6 +155,12 @@ def set_field(fields):
         fields['default'] = 50000000  # 50M
         fields['resource'] = 1
     if fields['name'].upper() == 'DB_KEEP_CACHE_SIZE':
+        fields['tunable'] = False
+        fields['minval'] = 0
+        fields['maxval'] = 2000000000  # 2GB
+        fields['default'] = 500000000  # 500M
+        fields['resource'] = 1
+    if fields['name'].lower() == 'db_32k_cache_size':
         fields['tunable'] = False
         fields['minval'] = 0
         fields['maxval'] = 2000000000  # 2GB
@@ -182,19 +245,45 @@ def set_field(fields):
         fields['default'] = False
     if fields['name'].lower() == 'optimizer_dynamic_sampling':
         fields['tunable'] = True
-        fields['minval'] = 0
-        fields['maxval'] = 11
+        fields['minval'] = 2
+        fields['maxval'] = 10
         fields['default'] = 2
     if fields['name'].lower() == 'optimizer_adaptive_plans':
         fields['tunable'] = True
         fields['minval'] = None
         fields['maxval'] = None
         fields['default'] = True
+        fields['vartype'] = 4
+    if fields['name'].lower() == 'optimizer_adaptive_statistics':
+        fields['tunable'] = True
+        fields['minval'] = None
+        fields['maxval'] = None
+        fields['default'] = True
+        fields['vartype'] = 4
+    if fields['name'].lower() == 'optimizer_features_enable':
+        fields['tunable'] = True
+        fields['minval'] = None
+        fields['maxval'] = None
+        fields['default'] = '12.2.0.1'
+        fields['vartype'] = 5
+        fields['enumvals'] = '11.2.0.1,11.2.0.2,11.2.0.3,11.2.0.4,12.1.0.1,12.1.0.2,12.2.0.1'
     if fields['name'].upper() == 'DISK_ASYNCH_IO':
         fields['tunable'] = True
+        fields['vartype'] = 4
+        fields['default'] = True
+        fields['minval'] = None
+        fields['maxval'] = None
+    if fields['name'].lower() == 'db_writer_processes':
+        fields['tunable'] = False
+        fields['minval'] = 1
+        fields['maxval'] = 10
+        fields['default'] = 1
+    if fields['name'].lower() == 'filesystemio_options':
+        fields['default'] = 'none'
+        fields['minval'] = None
+        fields['maxval'] = None
         fields['vartype'] = 5
-        fields['enumvals'] = 'TRUE,FALSE'
-        fields['default'] = 'TRUE'
+        fields['enumvals'] = 'asynch,directio,none,setall'
 
 
 COLNAMES = ("NAME", "TYPE", "DEFAULT_VALUE", "DESCRIPTION")
@@ -202,6 +291,7 @@ COLNAMES = ("NAME", "TYPE", "DEFAULT_VALUE", "DESCRIPTION")
 
 def process_version(version, delim=','):
     fields_list = []
+    add_fields(fields_list, version)
     with open('oracle{}.csv'.format(version), 'r', newline='') as f:
         reader = csv.reader(f, delimiter=delim)
         header = [h.upper() for h in next(reader)]

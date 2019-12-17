@@ -98,6 +98,32 @@ class BasicGP(BaseModel):
         [
             'GPRC/kern/kernels/0/variance',
             'GPRC/kern/kernels/0/lengthscales',
+        ]
+    ]
+
+    def _get_kernel_kwargs(self, **kwargs):
+        X_dim = kwargs.pop('X_dim')
+        return [
+            {
+                'input_dim': X_dim,
+                'ARD': False
+            }
+        ]
+
+    def _build_kernel(self, kernel_kwargs, **kwargs):
+        k = gpflow.kernels.Matern12(lengthscales=2, **kernel_kwargs[0])
+        if kwargs.pop('optimize_hyperparameters'):
+            k.lengthscales.transform = gpflow.transforms.Logistic(
+                *self._LENGTHSCALE_BOUNDS)
+        return k
+
+
+class ExpWhiteGP(BaseModel):
+
+    _KERNEL_HP_KEYS = [
+        [
+            'GPRC/kern/kernels/0/variance',
+            'GPRC/kern/kernels/0/lengthscales',
         ],
         [
             'GPRC/kern/kernels/1/variance',
@@ -128,6 +154,7 @@ class BasicGP(BaseModel):
 
 _MODEL_MAP = {
     'BasicGP': BasicGP,
+    'ExpWhiteGP': ExpWhiteGP,
 }
 
 

@@ -163,7 +163,17 @@ class BaseParser:
 
         return knob_data
 
-    def _check_knob_num_in_range(self, value, mdata):
+    def _check_knob_num_in_range(self, value, mdata, fix_knob_range=True):
+        minval = float(mdata.minval)
+        maxval = float(mdata.maxval)
+        if fix_knob_range:
+            if minval > value:
+                LOG.debug("Changing knob %s minval from %f to %f", mdata.name, minval, value)
+                mdata.minval = str(value)
+            if maxval < value:
+                LOG.debug("Changing knob %s maxval from %f to %f", mdata.name, maxval, value)
+                mdata.maxval = str(value)
+            mdata.save()
         return float(mdata.minval) <= value <= float(mdata.maxval)
 
     def _check_knob_bool_val(self, value):
@@ -351,7 +361,7 @@ class BaseParser:
         return configuration
 
     def format_bool(self, bool_value, metadata):
-        return self.true_value if bool_value == BooleanType.TRUE else self.false_value
+        return self.true_value if int(round(bool_value)) == BooleanType.TRUE else self.false_value
 
     def format_enum(self, enum_value, metadata):
         enumvals = metadata.enumvals.split(',')
